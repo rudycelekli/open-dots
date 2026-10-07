@@ -1,0 +1,36 @@
+name: Candidate frontend checks
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/candidate-frontend-checks.yml'
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 2c1df3a8c3580f942f7f593eec67dbdcb30dfe97
+      - name: Verify approved source
+        run: |
+          test "$(git rev-parse HEAD)" = "2c1df3a8c3580f942f7f593eec67dbdcb30dfe97"
+          test "$(git rev-parse HEAD^{tree})" = "a629d63023dc3046dce18b7d99cc96be19965484"
+          sha256sum frontend/package-lock.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+      - name: Build production frontend
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_BASE_URL: http://127.0.0.1:8000/api/v1
+        run: npm run build
