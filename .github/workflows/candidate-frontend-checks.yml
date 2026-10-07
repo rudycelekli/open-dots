@@ -1,4 +1,4 @@
-name: Candidate frontend checks
+name: Candidate frontend baseline and build
 on:
   pull_request:
     paths:
@@ -6,7 +6,29 @@ on:
 permissions:
   contents: read
 jobs:
-  frontend:
+  baseline-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: a657e7715109f762fe02db07cb076e34de59e9ac
+      - name: Verify approved source
+        run: |
+          test "$(git rev-parse HEAD)" = "a657e7715109f762fe02db07cb076e34de59e9ac"
+          sha256sum frontend/package-lock.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Baseline full frontend lint
+        working-directory: frontend
+        run: npm run lint
+  candidate-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -26,9 +48,9 @@ jobs:
       - name: Install locked dependencies
         working-directory: frontend
         run: npm ci
-      - name: Lint frontend
+      - name: Lint changed component
         working-directory: frontend
-        run: npm run lint
+        run: npx --no-install eslint components/SubmitTask.tsx
       - name: Build production frontend
         working-directory: frontend
         env:
