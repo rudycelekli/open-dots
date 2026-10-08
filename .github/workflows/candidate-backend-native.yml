@@ -1,0 +1,194 @@
+name: Candidate backend native qualification
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Root-reviewed immutable candidate or accepted baseline commit (40 hex)'
+        required: true
+        type: string
+      phase:
+        description: 'Evidence label only; all phases execute the same complete tests'
+        required: true
+        type: choice
+        options: [baseline, before, after]
+permissions:
+  contents: read
+concurrency:
+  group: backend-native-${{ inputs.source_sha }}
+  cancel-in-progress: false
+jobs:
+  backend:
+    if: github.repository == 'rudycelekli/open-dots'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:15.15@sha256:98fe06b500b5eb29e45bf8c073eb0ca399790ce17b1d586448edc4203627d342
+        env:
+          POSTGRES_USER: owned_fixture
+          POSTGRES_PASSWORD: owned_fixture_password
+          POSTGRES_DB: owned_fixture
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U owned_fixture -d owned_fixture"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      APPROVED_SOURCE_SHA: ${{ inputs.source_sha }}
+      QUALIFICATION_PHASE: ${{ inputs.phase }}
+      BOAT_BASE_URL: http://127.0.0.1:9
+      BOAT_API_KEY: owned_fixture_no_provider
+      BOAT_ORG_ID: ''
+      POSTGRES_USER: owned_fixture
+      POSTGRES_PASSWORD: owned_fixture_password
+      POSTGRES_DB: owned_fixture
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: '5432'
+      TOKEN_ENCRYPTION_KEYS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      HOOK_TOKEN: owned_fixture_hook_only
+      PERMISSION_HOOK_BASE_URL: http://127.0.0.1:9
+      TELEGRAM_BOT_TOKEN: ''
+      TELEGRAM_BOT_USERNAME: ''
+      UV_PYTHON_DOWNLOADS: never
+      UV_PYTHON: '3.14.8'
+    steps:
+      - name: Validate immutable input
+        run: |
+          [[ "$APPROVED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify approved source and lock
+        run: |
+          test "$(git rev-parse HEAD)" = "$APPROVED_SOURCE_SHA"
+          test ! -f backend/.env
+          test "$(sha256sum backend/uv.lock | cut -d ' ' -f1)" = eb3c49675ecafe84eb2d1bf94d8716418a551dd79a7ed9628ab94a794f7394e9
+          mkdir -p evidence
+          git rev-parse HEAD HEAD^{tree} > evidence/source.txt
+          sha256sum backend/pyproject.toml backend/uv.lock backend/.python-version > evidence/manifests.sha256
+          find backend/tests -name '*.py' -type f -print0 | sort -z | xargs -0 sha256sum > evidence/test-files.sha256
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14.8'
+          architecture: x64
+          freethreaded: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.24'
+          enable-cache: false
+          working-directory: backend
+      - name: Install unchanged locked backend dependencies
+        working-directory: backend
+        run: |
+          uv --version | tee ../evidence/uv-version.txt
+          python --version | tee ../evidence/python-version.txt
+          uv sync --locked --dev
+          .venv/bin/python -c 'import importlib.metadata as m,json; print(json.dumps({n:m.version(n) for n in ["pytest","pytest-asyncio","boat-sdk","fastapi","sqlalchemy","asyncpg","psycopg2-binary"]},sort_keys=True))' > ../evidence/native-versions.json
+          git diff --exit-code -- pyproject.toml uv.lock .python-version
+      - name: Install temporary loopback-only Python network guard
+        run: |
+          mkdir -p "$RUNNER_TEMP/owned-network"
+          cat > "$RUNNER_TEMP/owned-network/sitecustomize.py" <<'PY'
+          import ipaddress
+          import socket
+          original_connect = socket.socket.connect
+          original_connect_ex = socket.socket.connect_ex
+          original_getaddrinfo = socket.getaddrinfo
+          def allowed(address):
+              if isinstance(address, str):
+                  return
+              host = address[0]
+              if host == "localhost":
+                  return
+              try:
+                  permitted = ipaddress.ip_address(host).is_loopback
+              except ValueError:
+                  permitted = False
+              if not permitted:
+                  raise RuntimeError("qualification forbids non-loopback Python connections")
+          def connect(self, address):
+              allowed(address)
+              return original_connect(self, address)
+          def connect_ex(self, address):
+              allowed(address)
+              return original_connect_ex(self, address)
+          def getaddrinfo(host, *args, **kwargs):
+              if host is not None:
+                  allowed((host, 0))
+              return original_getaddrinfo(host, *args, **kwargs)
+          socket.socket.connect = connect
+          socket.socket.connect_ex = connect_ex
+          socket.getaddrinfo = getaddrinfo
+          PY
+          echo "PYTHONPATH=$RUNNER_TEMP/owned-network:$GITHUB_WORKSPACE/backend" >> "$GITHUB_ENV"
+      - name: Native admission and real disposable Postgres migrations
+        working-directory: backend
+        run: |
+          set -o pipefail
+          .venv/bin/python - <<'PY'
+          import ipaddress
+          import os
+          import socket
+          import tempfile
+          assert socket.socket.connect.__module__ == "sitecustomize"
+          expected = "qualification forbids non-loopback Python connections"
+          for name in ("connect", "connect_ex", "getaddrinfo"):
+              try:
+                  if name == "getaddrinfo":
+                      socket.getaddrinfo("192.0.2.1", 9)
+                  else:
+                      with socket.socket() as peer:
+                          getattr(peer, name)(("192.0.2.1", 9))
+              except RuntimeError as error:
+                  assert str(error) == expected, (name, str(error))
+              else:
+                  raise AssertionError(name + " did not reject before connection")
+          with socket.socket() as listener:
+              listener.bind(("127.0.0.1", 0))
+              listener.listen(2)
+              port = listener.getsockname()[1]
+              addresses = socket.getaddrinfo("localhost", port, type=socket.SOCK_STREAM)
+              assert addresses and all(ipaddress.ip_address(x[4][0]).is_loopback for x in addresses)
+              with socket.create_connection(("localhost", port), timeout=2):
+                  with listener.accept()[0]:
+                      pass
+              with socket.socket() as peer:
+                  peer.settimeout(2)
+                  assert peer.connect_ex(("127.0.0.1", port)) == 0
+                  with listener.accept()[0]:
+                      pass
+          with tempfile.TemporaryDirectory(prefix="owned-guard-") as directory:
+              address = os.path.join(directory, "socket")
+              with socket.socket(socket.AF_UNIX) as listener:
+                  listener.bind(address)
+                  listener.listen(1)
+                  with socket.socket(socket.AF_UNIX) as peer:
+                      peer.settimeout(2)
+                      peer.connect(address)
+                      with listener.accept()[0]:
+                          pass
+          print("guard selfchecks: 3 reserved-address rejections and 4 owned TCP/DNS/UNIX controls PASS")
+          PY
+          .venv/bin/python -m alembic upgrade head |& tee ../evidence/migrations.txt
+          .venv/bin/python -m alembic current |& tee ../evidence/database-revision.txt
+      - name: Collect all unchanged backend owners
+        working-directory: backend
+        run: |
+          set -o pipefail
+          .venv/bin/python -m pytest --collect-only -q tests |& tee ../evidence/collection.txt
+      - name: Execute complete native backend suite
+        working-directory: backend
+        run: |
+          set -o pipefail
+          .venv/bin/python -m pytest -vv --junitxml=../evidence/pytest.xml tests |& tee ../evidence/pytest.txt
+      - name: Verify manifests remain unchanged
+        if: always()
+        working-directory: backend
+        run: git diff --exit-code -- pyproject.toml uv.lock .python-version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: backend-native-${{ inputs.phase }}-${{ inputs.source_sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
