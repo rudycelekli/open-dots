@@ -67,15 +67,18 @@ function parseBlock(block: string): RunEvent | null {
 // across chunks); it calls onEvent once per complete frame.
 export function createSseParser(onEvent: (event: RunEvent) => void) {
   let buffer = "";
+  let previousChunkEndedWithCr = false;
   return {
     push(chunk: string) {
-      buffer = (buffer + chunk).replace(/\r\n/g, "\n");
-      // A trailing "\r" may be the first half of "\r\n": keep it for later.
-      const heldBack = buffer.endsWith("\r") ? "\r" : "";
-      if (heldBack) buffer = buffer.slice(0, -1);
-      buffer = buffer.replace(/\r/g, "\n");
+      if (chunk === "") return;
+      // CR already ended the previous line; a following LF is the same delimiter.
+      if (previousChunkEndedWithCr && chunk.startsWith("\n")) {
+        chunk = chunk.slice(1);
+      }
+      previousChunkEndedWithCr = chunk.endsWith("\r");
+      buffer += chunk.replace(/\r\n|\r/g, "\n");
       const blocks = buffer.split("\n\n");
-      buffer = (blocks.pop() ?? "") + heldBack;
+      buffer = blocks.pop() ?? "";
       for (const block of blocks) {
         const event = parseBlock(block);
         if (event) onEvent(event);
