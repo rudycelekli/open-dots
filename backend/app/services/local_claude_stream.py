@@ -187,7 +187,8 @@ class StreamNormalizer:
         )
         if not text.strip():
             return
-        key = (message.get("id"), text)
+        message_id = message.get("id")
+        key = (message_id if isinstance(message_id, str) else None, text)
         if key in self._message_keys:
             return
         self._message_keys.add(key)

@@ -151,3 +151,16 @@ def test_multibyte_text_and_bytes_input_work():
 def test_bytes_with_a_carriage_return_are_accepted():
     parser, _ = feed_all([start().encode() + b"\r", delta("x").encode() + b"\r"])
     assert parser.text == "x"
+
+
+def test_non_string_snapshot_ids_do_not_abort_following_result():
+    for malformed_id in ([], {}, ["nested"], {"nested": "id"}):
+        parser, emitted = feed_all([
+            snapshot("answer", message=malformed_id),
+            snapshot("answer", message=malformed_id),
+            json.dumps({"type": "result", "result": "done", "is_error": False}),
+        ])
+        assert emitted == ["answer"]
+        assert parser.take_messages() == ["answer"]
+        assert parser.final is not None
+        assert parser.final.text == "done" and not parser.final.is_error
