@@ -1,0 +1,88 @@
+name: Fork Open Dots stream qualification
+on:
+  push:
+    branches: [validation/open-dots-stream-20261016]
+permissions:
+  contents: read
+concurrency:
+  group: fork-open-dots-stream
+  cancel-in-progress: false
+jobs:
+  backend:
+    if: github.repository == 'rudycelekli/open-dots'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: vadoo
+          POSTGRES_PASSWORD: vadoo
+          POSTGRES_DB: vadoo
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      TOKEN_ENCRYPTION_KEYS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      POSTGRES_USER: vadoo
+      POSTGRES_PASSWORD: vadoo
+      POSTGRES_DB: vadoo
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: '5432'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: adbc543b481aafdd997b0a25781e475543aac096
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Guard exact candidate
+        run: |
+          test "$(git rev-parse HEAD)" = adbc543b481aafdd997b0a25781e475543aac096
+          test "$(git rev-parse HEAD^{tree})" = 8afa5b8bc43865dedbe864dd43cf6adfc5123e06
+          test "$(git rev-parse HEAD^)" = 804a7de548a156067d58f9413f8d2c8309d34c78
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          enable-cache: false
+      - name: Install exact backend lock and Python floor
+        working-directory: backend
+        run: uv sync --frozen --python 3.14
+      - name: Full backend SQLite suite on temporary database
+        working-directory: backend
+        env:
+          DATABASE_BACKEND: sqlite
+        run: uv run --frozen pytest -q
+      - name: Full backend PostgreSQL suite on ephemeral service
+        working-directory: backend
+        env:
+          DATABASE_BACKEND: postgres
+        run: |
+          uv run --frozen alembic upgrade head
+          uv run --frozen pytest -q
+      - name: Final source guard
+        if: always()
+        run: git diff --exit-code
+  frontend:
+    if: github.repository == 'rudycelekli/open-dots'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: adbc543b481aafdd997b0a25781e475543aac096
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24
+      - name: Install exact frontend lock and required gates
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+      - name: Final source guard
+        if: always()
+        run: |
+          test "$(git rev-parse HEAD)" = adbc543b481aafdd997b0a25781e475543aac096
+          test "$(git rev-parse HEAD^{tree})" = 8afa5b8bc43865dedbe864dd43cf6adfc5123e06
+          git diff --exit-code
