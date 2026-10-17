@@ -1,0 +1,59 @@
+name: Fork Open Dots schema baseline comparison
+on:
+  push:
+    branches: [validation/open-dots-schema-compare-20261016]
+permissions:
+  contents: read
+concurrency:
+  group: fork-open-dots-stream
+  cancel-in-progress: false
+jobs:
+  backend:
+    if: github.repository == 'rudycelekli/open-dots'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        source: [804a7de548a156067d58f9413f8d2c8309d34c78, adbc543b481aafdd997b0a25781e475543aac096]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: vadoo
+          POSTGRES_PASSWORD: vadoo
+          POSTGRES_DB: vadoo
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      TOKEN_ENCRYPTION_KEYS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      POSTGRES_USER: vadoo
+      POSTGRES_PASSWORD: vadoo
+      POSTGRES_DB: vadoo
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: '5432'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.source }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Guard exact source
+        run: test "$(git rev-parse HEAD)" = "${{ matrix.source }}"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          enable-cache: false
+      - name: Install exact backend lock and Python floor
+        working-directory: backend
+        run: uv sync --frozen --python 3.14
+      - name: Schema equivalence PostgreSQL regression
+        working-directory: backend
+        env:
+          DATABASE_BACKEND: postgres
+        run: |
+          uv run --frozen alembic upgrade head
+          uv run --frozen pytest tests/db/test_schema_equivalence.py -q -vv
+      - name: Final source guard
+        if: always()
+        run: git diff --exit-code
