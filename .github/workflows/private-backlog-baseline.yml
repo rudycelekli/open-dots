@@ -1,0 +1,93 @@
+name: Open Dots exact current backlog baseline
+'on':
+  push:
+    branches:
+    - validation/opendots-backlog-baseline-20261021
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      DATABASE_BACKEND: sqlite
+      TOKEN_ENCRYPTION_KEYS: 3n3b2YkQd0xVv8m1c1m0nq1l4Z3xk9q0n7xv7y5q8wE=
+    steps:
+    - uses: actions/checkout@v4.2.2
+      with:
+        repository: Anil-matcha/open-dots
+        ref: 701ca4fa965b77d96bd7c6ac6f355c4746385365
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v5.4.2
+    - run: uv sync --frozen
+      working-directory: backend
+    - name: Exact clean source guard
+      run: 'test "$(git rev-parse HEAD)" = 701ca4fa965b77d96bd7c6ac6f355c4746385365
+
+        test -z "$(git status --porcelain)"
+
+        uv --version
+
+        cd backend && uv run --no-sync python --version
+
+        cd .. && git rev-parse HEAD HEAD^{tree}
+
+        sha256sum backend/uv.lock backend/app/services/routine_schedule.py backend/app/services/routine_service.py
+
+        echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+
+        '
+    - name: Install only the bounded regression test on exact source
+      working-directory: backend
+      shell: python
+      run: 'import pathlib,base64,hashlib
+
+        p=pathlib.Path(''tests/services/test_routine_service.py'')
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==''bdfbbee81f41bbf6a867a77a08ae7768a82a7599d269e7832ffe2f1dd0df8168''
+
+        p.write_bytes(p.read_bytes()+base64.b64decode(''CgpAcHl0ZXN0LmZpeHR1cmUoYXV0b3VzZT1UcnVlKQpkZWYgcmV2aWV3X25vX2V4dGVybmFsX2Nvbm5lY3Rpb25zKG1vbmtleXBhdGNoKToKICAgIGltcG9ydCBzb2NrZXQKICAgIG9yaWdpbmFsID0gc29ja2V0LnNvY2tldC5jb25uZWN0CiAgICBkZWYgY29ubmVjdChzb2NrLCBhZGRyZXNzKToKICAgICAgICBpZiBpc2luc3RhbmNlKGFkZHJlc3MsIHR1cGxlKSBhbmQgYWRkcmVzc1swXSBub3QgaW4gKCIxMjcuMC4wLjEiLCAiOjoxIiwgImxvY2FsaG9zdCIpOgogICAgICAgICAgICByYWlzZSBBc3NlcnRpb25FcnJvcihmIkV4dGVybmFsIG5ldHdvcmsgZm9yYmlkZGVuIGluIG93bmVkIGJhc2VsaW5lOiB7YWRkcmVzcyFyfSIpCiAgICAgICAgcmV0dXJuIG9yaWdpbmFsKHNvY2ssIGFkZHJlc3MpCiAgICBtb25rZXlwYXRjaC5zZXRhdHRyKHNvY2tldC5zb2NrZXQsICJjb25uZWN0IiwgY29ubmVjdCkKCgphc3luYyBkZWYgdGVzdF9yZXZpZXdfZWlnaHRfZGF5X2JhY2tsb2dfdXNlc19sYXRlc3RfZWxpZ2libGVfb2NjdXJyZW5jZShzY2hlZHVsZXIsIHNlc3Npb25zLCBvd25lciwgYWdlbnQsIGNsb2NrKToKICAgIGltcG9ydCBqc29uCiAgICBpbXBvcnQgb3MKICAgIGZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAogICAgcm91dGluZSA9IGF3YWl0IG1ha2Vfcm91dGluZShzZXNzaW9ucywgb3duZXIsIGFnZW50LCBjbG9jaywgY2F0Y2hfdXBfbWludXRlcz02MCkKICAgIGZpcnN0X2R1ZSA9IHJvdXRpbmUubmV4dF9ydW5fYXQKICAgIGNsb2NrLmFkdmFuY2UoZGF5cz04LCBzZWNvbmRzPTIwKQogICAgYXdhaXQgc2NoZWR1bGVyLnRpY2soKQogICAgcm93cyA9IGF3YWl0IHJ1bnNfb2Yoc2Vzc2lvbnMsIHJvdXRpbmUuaWQpCiAgICByZWZyZXNoZWQgPSBhd2FpdCByZWxvYWQoc2Vzc2lvbnMsIFJvdXRpbmUsIHJvdXRpbmUuaWQpCiAgICBleHBlY3RlZF9sYXRlc3QgPSBjbG9jay5ub3cucmVwbGFjZShzZWNvbmQ9MCwgbWljcm9zZWNvbmQ9MCkKICAgICMgSW5kZXBlbmRlbnQgYXJpdGhtZXRpYyBvcmFjbGUgZm9yIGFuIGV2ZXJ5LW1pbnV0ZSBVVEMgc2NoZWR1bGUuCiAgICBleHBlY3RlZF9wYXNzZWQgPSBpbnQoKGV4cGVjdGVkX2xhdGVzdCAtIGZpcnN0X2R1ZSkudG90YWxfc2Vjb25kcygpIC8vIDYwKQogICAgcmVjZWlwdCA9IHsiZmlyc3RfZHVlIjogZmlyc3RfZHVlLmlzb2Zvcm1hdCgpLCAibm93IjogY2xvY2subm93Lmlzb2Zvcm1hdCgpLCAiZXhwZWN0ZWRfbGF0ZXN0IjogZXhwZWN0ZWRfbGF0ZXN0Lmlzb2Zvcm1hdCgpLCAiZXhwZWN0ZWRfcGFzc2VkIjogZXhwZWN0ZWRfcGFzc2VkLCAibmV4dF9ydW5fYXQiOiByZWZyZXNoZWQubmV4dF9ydW5fYXQuaXNvZm9ybWF0KCksICJydW5zIjogW3sic3RhdGUiOiByLnN0YXRlLCAic2NoZWR1bGVkX2ZvciI6IHIuc2NoZWR1bGVkX2Zvci5pc29mb3JtYXQoKSwgImVycm9yIjogci5lcnJvcn0gZm9yIHIgaW4gcm93c119CiAgICBQYXRoKG9zLmVudmlyb25bIlJVTk5FUl9URU1QIl0sICJyb3V0aW5lLWJhY2tsb2ctaW50ZWdyYXRpb24uanNvbiIpLndyaXRlX3RleHQoanNvbi5kdW1wcyhyZWNlaXB0LCBpbmRlbnQ9MikpCiAgICBwcmludChqc29uLmR1bXBzKHJlY2VpcHQsIGluZGVudD0yKSkKICAgIGFzc2VydCByZWZyZXNoZWQubmV4dF9ydW5fYXQgPT0gZXhwZWN0ZWRfbGF0ZXN0ICsgdGltZWRlbHRhKG1pbnV0ZXM9MSkKICAgIGFzc2VydCBsZW4ocm93cykgPT0gMgogICAgbWlzc2VkLCBsYXRlc3QgPSByb3dzCiAgICBhc3NlcnQgbWlzc2VkLmVycm9yLnN0YXJ0c3dpdGgoZiJ7ZXhwZWN0ZWRfcGFzc2VkfSBlYXJsaWVyIG9jY3VycmVuY2VzIikKICAgIGFzc2VydCBsYXRlc3Quc2NoZWR1bGVkX2ZvciA9PSBleHBlY3RlZF9sYXRlc3QgYW5kIGxhdGVzdC5zdGF0ZSA9PSAicnVubmluZyIKICAgIGF3YWl0IHNldHRsZWQoc2NoZWR1bGVyLCBzZXNzaW9ucywgbGF0ZXN0LmlkKQo=''))
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==''a153a6a3d672ec0f4d01cdb17fae214290b5849a7b79cc9c55b02ea7dc160214''
+
+        '
+    - name: Real scheduler SQLite clock-controlled baseline and existing catchup control
+      id: regression
+      continue-on-error: true
+      working-directory: backend
+      run: uv run --no-sync pytest -q -s tests/services/test_routine_service.py -k "test_review_eight_day_backlog_uses_latest_eligible_occurrence
+        or test_a_backlog_runs_its_newest_occurrence_once_and_records_the_rest or test_an_occurrence_later_than_the_catch_up_window_is_missed_not_run"
+        --junitxml="$RUNNER_TEMP/baseline-junit.xml"
+    - name: Validate baseline test identity and exact expected failure
+      shell: python
+      run: 'import pathlib,hashlib,xml.etree.ElementTree as E,os,json,subprocess
+
+        p=pathlib.Path(''backend/tests/services/test_routine_service.py'')
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==''a153a6a3d672ec0f4d01cdb17fae214290b5849a7b79cc9c55b02ea7dc160214''
+
+        assert subprocess.check_output([''git'',''diff'',''--name-only''],text=True).splitlines()==[''backend/tests/services/test_routine_service.py'']
+
+        r=E.parse(pathlib.Path(os.environ[''RUNNER_TEMP''],''baseline-junit.xml'')).getroot()
+
+        cases=list(r.iter(''testcase''));assert len(cases)==3 and not list(r.iter(''skipped''))
+
+        assert {c.attrib[''name''] for c in cases}=={''test_review_eight_day_backlog_uses_latest_eligible_occurrence'',''test_a_backlog_runs_its_newest_occurrence_once_and_records_the_rest'',''test_an_occurrence_later_than_the_catch_up_window_is_missed_not_run''}
+
+        assert len([c for c in cases if c.find(''failure'') is not None])==1 and not list(r.iter(''error''))
+
+        f=[c for c in cases if c.find(''failure'') is not None][0];assert f.attrib[''name'']==''test_review_eight_day_backlog_uses_latest_eligible_occurrence''
+
+        d=json.loads(pathlib.Path(os.environ[''RUNNER_TEMP''],''routine-backlog-integration.json'').read_text());assert len(d[''runs''])==2
+        and all(x[''state'']==''missed'' for x in d[''runs'']);assert d[''runs''][1][''scheduled_for'']!=d[''expected_latest''];print(''Exact
+        frozen source actual SQLite scheduler bug reproduced; no fixed candidate qualified'')
+
+        '
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: open-dots-backlog-baseline-${{ github.run_id }}
+        path: '${{ runner.temp }}/routine-backlog-integration.json
+
+          ${{ runner.temp }}/baseline-junit.xml'
+        if-no-files-found: error
