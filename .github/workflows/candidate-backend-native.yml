@@ -1,194 +1,78 @@
-name: Candidate backend native qualification
-on:
-  workflow_dispatch:
-    inputs:
-      source_sha:
-        description: 'Root-reviewed immutable candidate or accepted baseline commit (40 hex)'
-        required: true
-        type: string
-      phase:
-        description: 'Evidence label only; all phases execute the same complete tests'
-        required: true
-        type: choice
-        options: [baseline, before, after]
+name: Open Dots actual SQLite backlog baseline
+'on':
+  workflow_dispatch: {}
 permissions:
   contents: read
-concurrency:
-  group: backend-native-${{ inputs.source_sha }}
-  cancel-in-progress: false
 jobs:
-  backend:
-    if: github.repository == 'rudycelekli/open-dots'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:15.15@sha256:98fe06b500b5eb29e45bf8c073eb0ca399790ce17b1d586448edc4203627d342
-        env:
-          POSTGRES_USER: owned_fixture
-          POSTGRES_PASSWORD: owned_fixture_password
-          POSTGRES_DB: owned_fixture
-        ports: [5432:5432]
-        options: >-
-          --health-cmd "pg_isready -U owned_fixture -d owned_fixture"
-          --health-interval 5s --health-timeout 5s --health-retries 12
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
-      APPROVED_SOURCE_SHA: ${{ inputs.source_sha }}
-      QUALIFICATION_PHASE: ${{ inputs.phase }}
-      BOAT_BASE_URL: http://127.0.0.1:9
-      BOAT_API_KEY: owned_fixture_no_provider
-      BOAT_ORG_ID: ''
-      POSTGRES_USER: owned_fixture
-      POSTGRES_PASSWORD: owned_fixture_password
-      POSTGRES_DB: owned_fixture
-      POSTGRES_HOST: 127.0.0.1
-      POSTGRES_PORT: '5432'
-      TOKEN_ENCRYPTION_KEYS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-      HOOK_TOKEN: owned_fixture_hook_only
-      PERMISSION_HOOK_BASE_URL: http://127.0.0.1:9
-      TELEGRAM_BOT_TOKEN: ''
-      TELEGRAM_BOT_USERNAME: ''
-      UV_PYTHON_DOWNLOADS: never
-      UV_PYTHON: '3.14.8'
+      DATABASE_BACKEND: sqlite
+      TOKEN_ENCRYPTION_KEYS: 3n3b2YkQd0xVv8m1c1m0nq1l4Z3xk9q0n7xv7y5q8wE=
     steps:
-      - name: Validate immutable input
-        run: |
-          [[ "$APPROVED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.source_sha }}
-          persist-credentials: false
-      - name: Verify approved source and lock
-        run: |
-          test "$(git rev-parse HEAD)" = "$APPROVED_SOURCE_SHA"
-          test ! -f backend/.env
-          test "$(sha256sum backend/uv.lock | cut -d ' ' -f1)" = eb3c49675ecafe84eb2d1bf94d8716418a551dd79a7ed9628ab94a794f7394e9
-          mkdir -p evidence
-          git rev-parse HEAD HEAD^{tree} > evidence/source.txt
-          sha256sum backend/pyproject.toml backend/uv.lock backend/.python-version > evidence/manifests.sha256
-          find backend/tests -name '*.py' -type f -print0 | sort -z | xargs -0 sha256sum > evidence/test-files.sha256
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.14.8'
-          architecture: x64
-          freethreaded: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: '0.12.24'
-          enable-cache: false
-          working-directory: backend
-      - name: Install unchanged locked backend dependencies
-        working-directory: backend
-        run: |
-          uv --version | tee ../evidence/uv-version.txt
-          python --version | tee ../evidence/python-version.txt
-          uv sync --locked --dev
-          .venv/bin/python -c 'import importlib.metadata as m,json; print(json.dumps({n:m.version(n) for n in ["pytest","pytest-asyncio","boat-sdk","fastapi","sqlalchemy","asyncpg","psycopg2-binary"]},sort_keys=True))' > ../evidence/native-versions.json
-          git diff --exit-code -- pyproject.toml uv.lock .python-version
-      - name: Install temporary loopback-only Python network guard
-        run: |
-          mkdir -p "$RUNNER_TEMP/owned-network"
-          cat > "$RUNNER_TEMP/owned-network/sitecustomize.py" <<'PY'
-          import ipaddress
-          import socket
-          original_connect = socket.socket.connect
-          original_connect_ex = socket.socket.connect_ex
-          original_getaddrinfo = socket.getaddrinfo
-          def allowed(address):
-              if isinstance(address, str):
-                  return
-              host = address[0]
-              if host == "localhost":
-                  return
-              try:
-                  permitted = ipaddress.ip_address(host).is_loopback
-              except ValueError:
-                  permitted = False
-              if not permitted:
-                  raise RuntimeError("qualification forbids non-loopback Python connections")
-          def connect(self, address):
-              allowed(address)
-              return original_connect(self, address)
-          def connect_ex(self, address):
-              allowed(address)
-              return original_connect_ex(self, address)
-          def getaddrinfo(host, *args, **kwargs):
-              if host is not None:
-                  allowed((host, 0))
-              return original_getaddrinfo(host, *args, **kwargs)
-          socket.socket.connect = connect
-          socket.socket.connect_ex = connect_ex
-          socket.getaddrinfo = getaddrinfo
-          PY
-          echo "PYTHONPATH=$RUNNER_TEMP/owned-network:$GITHUB_WORKSPACE/backend" >> "$GITHUB_ENV"
-      - name: Native admission and real disposable Postgres migrations
-        working-directory: backend
-        run: |
-          set -o pipefail
-          .venv/bin/python - <<'PY'
-          import ipaddress
-          import os
-          import socket
-          import tempfile
-          assert socket.socket.connect.__module__ == "sitecustomize"
-          expected = "qualification forbids non-loopback Python connections"
-          for name in ("connect", "connect_ex", "getaddrinfo"):
-              try:
-                  if name == "getaddrinfo":
-                      socket.getaddrinfo("192.0.2.1", 9)
-                  else:
-                      with socket.socket() as peer:
-                          getattr(peer, name)(("192.0.2.1", 9))
-              except RuntimeError as error:
-                  assert str(error) == expected, (name, str(error))
-              else:
-                  raise AssertionError(name + " did not reject before connection")
-          with socket.socket() as listener:
-              listener.bind(("127.0.0.1", 0))
-              listener.listen(2)
-              port = listener.getsockname()[1]
-              addresses = socket.getaddrinfo("localhost", port, type=socket.SOCK_STREAM)
-              assert addresses and all(ipaddress.ip_address(x[4][0]).is_loopback for x in addresses)
-              with socket.create_connection(("localhost", port), timeout=2):
-                  with listener.accept()[0]:
-                      pass
-              with socket.socket() as peer:
-                  peer.settimeout(2)
-                  assert peer.connect_ex(("127.0.0.1", port)) == 0
-                  with listener.accept()[0]:
-                      pass
-          with tempfile.TemporaryDirectory(prefix="owned-guard-") as directory:
-              address = os.path.join(directory, "socket")
-              with socket.socket(socket.AF_UNIX) as listener:
-                  listener.bind(address)
-                  listener.listen(1)
-                  with socket.socket(socket.AF_UNIX) as peer:
-                      peer.settimeout(2)
-                      peer.connect(address)
-                      with listener.accept()[0]:
-                          pass
-          print("guard selfchecks: 3 reserved-address rejections and 4 owned TCP/DNS/UNIX controls PASS")
-          PY
-          .venv/bin/python -m alembic upgrade head |& tee ../evidence/migrations.txt
-          .venv/bin/python -m alembic current |& tee ../evidence/database-revision.txt
-      - name: Collect all unchanged backend owners
-        working-directory: backend
-        run: |
-          set -o pipefail
-          .venv/bin/python -m pytest --collect-only -q tests |& tee ../evidence/collection.txt
-      - name: Execute complete native backend suite
-        working-directory: backend
-        run: |
-          set -o pipefail
-          .venv/bin/python -m pytest -vv --junitxml=../evidence/pytest.xml tests |& tee ../evidence/pytest.txt
-      - name: Verify manifests remain unchanged
-        if: always()
-        working-directory: backend
-        run: git diff --exit-code -- pyproject.toml uv.lock .python-version
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: backend-native-${{ inputs.phase }}-${{ inputs.source_sha }}
-          path: evidence/
-          if-no-files-found: error
-          retention-days: 14
+    - uses: actions/checkout@v4.2.2
+      with:
+        repository: Anil-matcha/open-dots
+        ref: c417f0987f709e703dd9e32727422f1bc99688a1
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v5.4.2
+    - run: uv sync --frozen
+      working-directory: backend
+    - name: Exact clean source guard
+      run: 'test "$(git rev-parse HEAD)" = c417f0987f709e703dd9e32727422f1bc99688a1
+
+        test -z "$(git status --porcelain)"'
+    - name: Install only the bounded regression test on exact source
+      working-directory: backend
+      shell: python
+      run: 'import pathlib,base64,hashlib
+
+        p=pathlib.Path(''tests/services/test_routine_service.py'')
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==''bdfbbee81f41bbf6a867a77a08ae7768a82a7599d269e7832ffe2f1dd0df8168''
+
+        p.write_bytes(p.read_bytes()+base64.b64decode(''CgpAcHl0ZXN0LmZpeHR1cmUoYXV0b3VzZT1UcnVlKQpkZWYgcmV2aWV3X25vX2V4dGVybmFsX2Nvbm5lY3Rpb25zKG1vbmtleXBhdGNoKToKICAgIGltcG9ydCBzb2NrZXQKICAgIG9yaWdpbmFsID0gc29ja2V0LnNvY2tldC5jb25uZWN0CiAgICBkZWYgY29ubmVjdChzb2NrLCBhZGRyZXNzKToKICAgICAgICBpZiBpc2luc3RhbmNlKGFkZHJlc3MsIHR1cGxlKSBhbmQgYWRkcmVzc1swXSBub3QgaW4gKCIxMjcuMC4wLjEiLCAiOjoxIiwgImxvY2FsaG9zdCIpOgogICAgICAgICAgICByYWlzZSBBc3NlcnRpb25FcnJvcihmIkV4dGVybmFsIG5ldHdvcmsgZm9yYmlkZGVuIGluIG93bmVkIGJhc2VsaW5lOiB7YWRkcmVzcyFyfSIpCiAgICAgICAgcmV0dXJuIG9yaWdpbmFsKHNvY2ssIGFkZHJlc3MpCiAgICBtb25rZXlwYXRjaC5zZXRhdHRyKHNvY2tldC5zb2NrZXQsICJjb25uZWN0IiwgY29ubmVjdCkKCgphc3luYyBkZWYgdGVzdF9yZXZpZXdfZWlnaHRfZGF5X2JhY2tsb2dfdXNlc19sYXRlc3RfZWxpZ2libGVfb2NjdXJyZW5jZShzY2hlZHVsZXIsIHNlc3Npb25zLCBvd25lciwgYWdlbnQsIGNsb2NrKToKICAgIGltcG9ydCBqc29uCiAgICBpbXBvcnQgb3MKICAgIGZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAogICAgcm91dGluZSA9IGF3YWl0IG1ha2Vfcm91dGluZShzZXNzaW9ucywgb3duZXIsIGFnZW50LCBjbG9jaywgY2F0Y2hfdXBfbWludXRlcz02MCkKICAgIGZpcnN0X2R1ZSA9IHJvdXRpbmUubmV4dF9ydW5fYXQKICAgIGNsb2NrLmFkdmFuY2UoZGF5cz04LCBzZWNvbmRzPTIwKQogICAgYXdhaXQgc2NoZWR1bGVyLnRpY2soKQogICAgcm93cyA9IGF3YWl0IHJ1bnNfb2Yoc2Vzc2lvbnMsIHJvdXRpbmUuaWQpCiAgICByZWZyZXNoZWQgPSBhd2FpdCByZWxvYWQoc2Vzc2lvbnMsIFJvdXRpbmUsIHJvdXRpbmUuaWQpCiAgICBleHBlY3RlZF9sYXRlc3QgPSBjbG9jay5ub3cucmVwbGFjZShzZWNvbmQ9MCwgbWljcm9zZWNvbmQ9MCkKICAgICMgSW5kZXBlbmRlbnQgYXJpdGhtZXRpYyBvcmFjbGUgZm9yIGFuIGV2ZXJ5LW1pbnV0ZSBVVEMgc2NoZWR1bGUuCiAgICBleHBlY3RlZF9wYXNzZWQgPSBpbnQoKGV4cGVjdGVkX2xhdGVzdCAtIGZpcnN0X2R1ZSkudG90YWxfc2Vjb25kcygpIC8vIDYwKQogICAgcmVjZWlwdCA9IHsiZmlyc3RfZHVlIjogZmlyc3RfZHVlLmlzb2Zvcm1hdCgpLCAibm93IjogY2xvY2subm93Lmlzb2Zvcm1hdCgpLCAiZXhwZWN0ZWRfbGF0ZXN0IjogZXhwZWN0ZWRfbGF0ZXN0Lmlzb2Zvcm1hdCgpLCAiZXhwZWN0ZWRfcGFzc2VkIjogZXhwZWN0ZWRfcGFzc2VkLCAibmV4dF9ydW5fYXQiOiByZWZyZXNoZWQubmV4dF9ydW5fYXQuaXNvZm9ybWF0KCksICJydW5zIjogW3sic3RhdGUiOiByLnN0YXRlLCAic2NoZWR1bGVkX2ZvciI6IHIuc2NoZWR1bGVkX2Zvci5pc29mb3JtYXQoKSwgImVycm9yIjogci5lcnJvcn0gZm9yIHIgaW4gcm93c119CiAgICBQYXRoKG9zLmVudmlyb25bIlJVTk5FUl9URU1QIl0sICJyb3V0aW5lLWJhY2tsb2ctaW50ZWdyYXRpb24uanNvbiIpLndyaXRlX3RleHQoanNvbi5kdW1wcyhyZWNlaXB0LCBpbmRlbnQ9MikpCiAgICBwcmludChqc29uLmR1bXBzKHJlY2VpcHQsIGluZGVudD0yKSkKICAgIGFzc2VydCByZWZyZXNoZWQubmV4dF9ydW5fYXQgPT0gZXhwZWN0ZWRfbGF0ZXN0ICsgdGltZWRlbHRhKG1pbnV0ZXM9MSkKICAgIGFzc2VydCBsZW4ocm93cykgPT0gMgogICAgbWlzc2VkLCBsYXRlc3QgPSByb3dzCiAgICBhc3NlcnQgbWlzc2VkLmVycm9yLnN0YXJ0c3dpdGgoZiJ7ZXhwZWN0ZWRfcGFzc2VkfSBlYXJsaWVyIG9jY3VycmVuY2VzIikKICAgIGFzc2VydCBsYXRlc3Quc2NoZWR1bGVkX2ZvciA9PSBleHBlY3RlZF9sYXRlc3QgYW5kIGxhdGVzdC5zdGF0ZSA9PSAicnVubmluZyIKICAgIGF3YWl0IHNldHRsZWQoc2NoZWR1bGVyLCBzZXNzaW9ucywgbGF0ZXN0LmlkKQo=''))
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==''a153a6a3d672ec0f4d01cdb17fae214290b5849a7b79cc9c55b02ea7dc160214''
+
+        '
+    - name: Real scheduler SQLite clock-controlled baseline and existing catchup control
+      id: regression
+      continue-on-error: true
+      working-directory: backend
+      run: uv run --no-sync pytest -q -s tests/services/test_routine_service.py -k "test_review_eight_day_backlog_uses_latest_eligible_occurrence or test_a_backlog_runs_its_newest_occurrence_once_and_records_the_rest
+        or test_an_occurrence_later_than_the_catch_up_window_is_missed_not_run" --junitxml="$RUNNER_TEMP/baseline-junit.xml"
+    - name: Validate baseline test identity and exact expected failure
+      shell: python
+      run: 'import pathlib,hashlib,xml.etree.ElementTree as E,os,json,subprocess
+
+        p=pathlib.Path(''backend/tests/services/test_routine_service.py'')
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==''a153a6a3d672ec0f4d01cdb17fae214290b5849a7b79cc9c55b02ea7dc160214''
+
+        assert subprocess.check_output([''git'',''diff'',''--name-only''],text=True).splitlines()==[''backend/tests/services/test_routine_service.py'']
+
+        r=E.parse(pathlib.Path(os.environ[''RUNNER_TEMP''],''baseline-junit.xml'')).getroot()
+
+        cases=list(r.iter(''testcase''));assert len(cases)==3 and not list(r.iter(''skipped''))
+
+        assert {c.attrib[''name''] for c in cases}=={''test_review_eight_day_backlog_uses_latest_eligible_occurrence'',''test_a_backlog_runs_its_newest_occurrence_once_and_records_the_rest'',''test_an_occurrence_later_than_the_catch_up_window_is_missed_not_run''}
+
+        assert len([c for c in cases if c.find(''failure'') is not None])==1 and not list(r.iter(''error''))
+
+        f=[c for c in cases if c.find(''failure'') is not None][0];assert f.attrib[''name'']==''test_review_eight_day_backlog_uses_latest_eligible_occurrence''
+
+        d=json.loads(pathlib.Path(os.environ[''RUNNER_TEMP''],''routine-backlog-integration.json'').read_text());assert len(d[''runs''])==2 and all(x[''state'']==''missed''
+        for x in d[''runs'']);assert d[''runs''][1][''scheduled_for'']!=d[''expected_latest''];print(''Exact frozen source actual SQLite scheduler bug reproduced;
+        no fixed candidate qualified'')
+
+        '
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: open-dots-backlog-baseline-${{ github.run_id }}
+        path: '${{ runner.temp }}/routine-backlog-integration.json
+
+          ${{ runner.temp }}/baseline-junit.xml'
+        if-no-files-found: error
