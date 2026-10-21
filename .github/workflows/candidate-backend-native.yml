@@ -1,194 +1,298 @@
-name: Candidate backend native qualification
-on:
-  workflow_dispatch:
-    inputs:
-      source_sha:
-        description: 'Root-reviewed immutable candidate or accepted baseline commit (40 hex)'
-        required: true
-        type: string
-      phase:
-        description: 'Evidence label only; all phases execute the same complete tests'
-        required: true
-        type: choice
-        options: [baseline, before, after]
+name: Open Dots private bounded gap candidate proof
+'on':
+  workflow_dispatch: {}
 permissions:
   contents: read
-concurrency:
-  group: backend-native-${{ inputs.source_sha }}
-  cancel-in-progress: false
 jobs:
-  backend:
-    if: github.repository == 'rudycelekli/open-dots'
-    runs-on: ubuntu-24.04
+  focused:
+    runs-on: ubuntu-latest
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:15.15@sha256:98fe06b500b5eb29e45bf8c073eb0ca399790ce17b1d586448edc4203627d342
-        env:
-          POSTGRES_USER: owned_fixture
-          POSTGRES_PASSWORD: owned_fixture_password
-          POSTGRES_DB: owned_fixture
-        ports: [5432:5432]
-        options: >-
-          --health-cmd "pg_isready -U owned_fixture -d owned_fixture"
-          --health-interval 5s --health-timeout 5s --health-retries 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - dataset: locked-package
+          tzpath: ''
+        - dataset: system
+          tzpath: /usr/share/zoneinfo
     env:
-      APPROVED_SOURCE_SHA: ${{ inputs.source_sha }}
-      QUALIFICATION_PHASE: ${{ inputs.phase }}
-      BOAT_BASE_URL: http://127.0.0.1:9
-      BOAT_API_KEY: owned_fixture_no_provider
-      BOAT_ORG_ID: ''
-      POSTGRES_USER: owned_fixture
-      POSTGRES_PASSWORD: owned_fixture_password
-      POSTGRES_DB: owned_fixture
-      POSTGRES_HOST: 127.0.0.1
-      POSTGRES_PORT: '5432'
-      TOKEN_ENCRYPTION_KEYS: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-      HOOK_TOKEN: owned_fixture_hook_only
-      PERMISSION_HOOK_BASE_URL: http://127.0.0.1:9
-      TELEGRAM_BOT_TOKEN: ''
-      TELEGRAM_BOT_USERNAME: ''
-      UV_PYTHON_DOWNLOADS: never
-      UV_PYTHON: '3.14.8'
+      DATABASE_BACKEND: sqlite
+      TOKEN_ENCRYPTION_KEYS: 3n3b2YkQd0xVv8m1c1m0nq1l4Z3xk9q0n7xv7y5q8wE=
+      PYTHONTZPATH: ${{ matrix.tzpath }}
     steps:
-      - name: Validate immutable input
-        run: |
-          [[ "$APPROVED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.source_sha }}
-          persist-credentials: false
-      - name: Verify approved source and lock
-        run: |
-          test "$(git rev-parse HEAD)" = "$APPROVED_SOURCE_SHA"
-          test ! -f backend/.env
-          test "$(sha256sum backend/uv.lock | cut -d ' ' -f1)" = eb3c49675ecafe84eb2d1bf94d8716418a551dd79a7ed9628ab94a794f7394e9
-          mkdir -p evidence
-          git rev-parse HEAD HEAD^{tree} > evidence/source.txt
-          sha256sum backend/pyproject.toml backend/uv.lock backend/.python-version > evidence/manifests.sha256
-          find backend/tests -name '*.py' -type f -print0 | sort -z | xargs -0 sha256sum > evidence/test-files.sha256
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.14.8'
-          architecture: x64
-          freethreaded: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: '0.12.24'
-          enable-cache: false
-          working-directory: backend
-      - name: Install unchanged locked backend dependencies
-        working-directory: backend
-        run: |
-          uv --version | tee ../evidence/uv-version.txt
-          python --version | tee ../evidence/python-version.txt
-          uv sync --locked --dev
-          .venv/bin/python -c 'import importlib.metadata as m,json; print(json.dumps({n:m.version(n) for n in ["pytest","pytest-asyncio","boat-sdk","fastapi","sqlalchemy","asyncpg","psycopg2-binary"]},sort_keys=True))' > ../evidence/native-versions.json
-          git diff --exit-code -- pyproject.toml uv.lock .python-version
-      - name: Install temporary loopback-only Python network guard
-        run: |
-          mkdir -p "$RUNNER_TEMP/owned-network"
-          cat > "$RUNNER_TEMP/owned-network/sitecustomize.py" <<'PY'
-          import ipaddress
-          import socket
-          original_connect = socket.socket.connect
-          original_connect_ex = socket.socket.connect_ex
-          original_getaddrinfo = socket.getaddrinfo
-          def allowed(address):
-              if isinstance(address, str):
-                  return
-              host = address[0]
-              if host == "localhost":
-                  return
-              try:
-                  permitted = ipaddress.ip_address(host).is_loopback
-              except ValueError:
-                  permitted = False
-              if not permitted:
-                  raise RuntimeError("qualification forbids non-loopback Python connections")
-          def connect(self, address):
-              allowed(address)
-              return original_connect(self, address)
-          def connect_ex(self, address):
-              allowed(address)
-              return original_connect_ex(self, address)
-          def getaddrinfo(host, *args, **kwargs):
-              if host is not None:
-                  allowed((host, 0))
-              return original_getaddrinfo(host, *args, **kwargs)
-          socket.socket.connect = connect
-          socket.socket.connect_ex = connect_ex
-          socket.getaddrinfo = getaddrinfo
-          PY
-          echo "PYTHONPATH=$RUNNER_TEMP/owned-network:$GITHUB_WORKSPACE/backend" >> "$GITHUB_ENV"
-      - name: Native admission and real disposable Postgres migrations
-        working-directory: backend
-        run: |
-          set -o pipefail
-          .venv/bin/python - <<'PY'
-          import ipaddress
-          import os
-          import socket
-          import tempfile
-          assert socket.socket.connect.__module__ == "sitecustomize"
-          expected = "qualification forbids non-loopback Python connections"
-          for name in ("connect", "connect_ex", "getaddrinfo"):
-              try:
-                  if name == "getaddrinfo":
-                      socket.getaddrinfo("192.0.2.1", 9)
-                  else:
-                      with socket.socket() as peer:
-                          getattr(peer, name)(("192.0.2.1", 9))
-              except RuntimeError as error:
-                  assert str(error) == expected, (name, str(error))
-              else:
-                  raise AssertionError(name + " did not reject before connection")
-          with socket.socket() as listener:
-              listener.bind(("127.0.0.1", 0))
-              listener.listen(2)
-              port = listener.getsockname()[1]
-              addresses = socket.getaddrinfo("localhost", port, type=socket.SOCK_STREAM)
-              assert addresses and all(ipaddress.ip_address(x[4][0]).is_loopback for x in addresses)
-              with socket.create_connection(("localhost", port), timeout=2):
-                  with listener.accept()[0]:
-                      pass
-              with socket.socket() as peer:
-                  peer.settimeout(2)
-                  assert peer.connect_ex(("127.0.0.1", port)) == 0
-                  with listener.accept()[0]:
-                      pass
-          with tempfile.TemporaryDirectory(prefix="owned-guard-") as directory:
-              address = os.path.join(directory, "socket")
-              with socket.socket(socket.AF_UNIX) as listener:
-                  listener.bind(address)
-                  listener.listen(1)
-                  with socket.socket(socket.AF_UNIX) as peer:
-                      peer.settimeout(2)
-                      peer.connect(address)
-                      with listener.accept()[0]:
-                          pass
-          print("guard selfchecks: 3 reserved-address rejections and 4 owned TCP/DNS/UNIX controls PASS")
-          PY
-          .venv/bin/python -m alembic upgrade head |& tee ../evidence/migrations.txt
-          .venv/bin/python -m alembic current |& tee ../evidence/database-revision.txt
-      - name: Collect all unchanged backend owners
-        working-directory: backend
-        run: |
-          set -o pipefail
-          .venv/bin/python -m pytest --collect-only -q tests |& tee ../evidence/collection.txt
-      - name: Execute complete native backend suite
-        working-directory: backend
-        run: |
-          set -o pipefail
-          .venv/bin/python -m pytest -vv --junitxml=../evidence/pytest.xml tests |& tee ../evidence/pytest.txt
-      - name: Verify manifests remain unchanged
-        if: always()
-        working-directory: backend
-        run: git diff --exit-code -- pyproject.toml uv.lock .python-version
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: backend-native-${{ inputs.phase }}-${{ inputs.source_sha }}
-          path: evidence/
-          if-no-files-found: error
-          retention-days: 14
+    - uses: actions/checkout@v4.2.2
+      with:
+        repository: Anil-matcha/open-dots
+        ref: c417f0987f709e703dd9e32727422f1bc99688a1
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v5.4.2
+    - run: uv sync --frozen
+      working-directory: backend
+    - name: Exact clean source guard
+      run: 'test "$(git rev-parse HEAD)" = c417f0987f709e703dd9e32727422f1bc99688a1
+
+        test -z "$(git status --porcelain)"'
+    - name: Workflow-only SQLite observation and runtime network boundary
+      shell: python
+      run: 'import pathlib,base64,os
+
+        p=pathlib.Path(os.environ[''RUNNER_TEMP''],''proof-observer'');p.mkdir(exist_ok=True)
+
+        (p/''observe_sqlite.py'').write_bytes(base64.b64decode(''IiIiV29ya2Zsb3ctb25seSBvYnNlcnZlci4gUHJvZHVjdC90ZXN0cyBrZWVwIHRoZWlyIGV4YWN0IGZyb3plbiBieXRlcy4iIiIKaW1wb3J0IGpzb24KaW1wb3J0IG9zCmltcG9ydCBwYXRobGliCmltcG9ydCBzb2NrZXQKaW1wb3J0IHB5dGVzdAoKX2FydGlmYWN0cyA9IHBhdGhsaWIuUGF0aChvcy5lbnZpcm9uWyJQUk9PRl9BUlRJRkFDVF9ESVIiXSkKX3JlYWxfY29ubmVjdCA9IHNvY2tldC5zb2NrZXQuY29ubmVjdApfcmVhbF9jb25uZWN0X2V4ID0gc29ja2V0LnNvY2tldC5jb25uZWN0X2V4Cl9yZWFsX2dldGFkZHJpbmZvID0gc29ja2V0LmdldGFkZHJpbmZvCgpkZWYgX2xvY2FsKGFkZHJlc3MpOgogICAgcmV0dXJuIG5vdCBpc2luc3RhbmNlKGFkZHJlc3MsIHR1cGxlKSBvciBhZGRyZXNzWzBdIGluICgiMTI3LjAuMC4xIiwgIjo6MSIsICJsb2NhbGhvc3QiKQpkZWYgX2Nvbm5lY3Qoc29jaywgYWRkcmVzcyk6CiAgICBhc3NlcnQgX2xvY2FsKGFkZHJlc3MpLCAiRXh0ZXJuYWwgY29ubmVjdGlvbiBpcyBub3QgYXV0aG9yaXplZCBpbiB0aGlzIG93bmVkIHByb29mIgogICAgcmV0dXJuIF9yZWFsX2Nvbm5lY3Qoc29jaywgYWRkcmVzcykKZGVmIF9jb25uZWN0X2V4KHNvY2ssIGFkZHJlc3MpOgogICAgYXNzZXJ0IF9sb2NhbChhZGRyZXNzKSwgIkV4dGVybmFsIGNvbm5lY3Rpb24gaXMgbm90IGF1dGhvcml6ZWQgaW4gdGhpcyBvd25lZCBwcm9vZiIKICAgIHJldHVybiBfcmVhbF9jb25uZWN0X2V4KHNvY2ssIGFkZHJlc3MpCmRlZiBfZ2V0YWRkcmluZm8oaG9zdCwgKmFyZ3MsICoqa3dhcmdzKToKICAgIGFzc2VydCBob3N0IGluIChOb25lLCAiMTI3LjAuMC4xIiwgIjo6MSIsICJsb2NhbGhvc3QiLCBiIjEyNy4wLjAuMSIsIGIiOjoxIiwgYiJsb2NhbGhvc3QiKSwgIkV4dGVybmFsIEROUyBpcyBub3QgYXV0aG9yaXplZCBpbiB0aGlzIG93bmVkIHByb29mIgogICAgcmV0dXJuIF9yZWFsX2dldGFkZHJpbmZvKGhvc3QsICphcmdzLCAqKmt3YXJncykKCnNvY2tldC5zb2NrZXQuY29ubmVjdCA9IF9jb25uZWN0CnNvY2tldC5zb2NrZXQuY29ubmVjdF9leCA9IF9jb25uZWN0X2V4CnNvY2tldC5nZXRhZGRyaW5mbyA9IF9nZXRhZGRyaW5mbwoKQHB5dGVzdC5ob29raW1wbChob29rd3JhcHBlcj1UcnVlKQpkZWYgcHl0ZXN0X3J1bnRlc3RfY2FsbChpdGVtKToKICAgIGlmIGdldGF0dHIoaXRlbSwgIm9yaWdpbmFsbmFtZSIsIE5vbmUpICE9ICJ0ZXN0X3Jldmlld19nYXBfY3JlYXRpb25fa2VlcHNfZG9jdW1lbnRlZF9zaGlmdGVkX29jY3VycmVuY2UiOgogICAgICAgIHlpZWxkCiAgICAgICAgcmV0dXJuCiAgICBtb2R1bGUgPSBpdGVtLm1vZHVsZQogICAgb3JpZ2luYWwgPSBtb2R1bGUucmVsb2FkCiAgICBhc3luYyBkZWYgb2JzZXJ2ZWRfcmVsb2FkKHNlc3Npb25zLCBtb2RlbCwga2V5KToKICAgICAgICByZXN1bHQgPSBhd2FpdCBvcmlnaW5hbChzZXNzaW9ucywgbW9kZWwsIGtleSkKICAgICAgICBpZiBtb2RlbC5fX25hbWVfXyA9PSAiUm91dGluZSI6CiAgICAgICAgICAgIHJlY2VpcHQgPSB7CiAgICAgICAgICAgICAgICAiY3JlYXRlZF9hdCI6IGl0ZW0uZnVuY2FyZ3NbImFmdGVyIl0sICJ0aW1lem9uZSI6ICJFdXJvcGUvQmVybGluIiwKICAgICAgICAgICAgICAgICJyZXF1ZXN0ZWRfd2FsbF90aW1lIjogIjAyOjMwIiwgImV4cGVjdGVkX3BlcnNpc3RlZF9uZXh0IjogaXRlbS5mdW5jYXJnc1siZXhwZWN0ZWQiXSwKICAgICAgICAgICAgICAgICJhY3R1YWxfcGVyc2lzdGVkX25leHQiOiByZXN1bHQubmV4dF9ydW5fYXQuaXNvZm9ybWF0KCksCiAgICAgICAgICAgICAgICAib2JzZXJ2ZXIiOiAiT3JpZ2luYWwgcmVhbCBTUUxpdGUgcmVsb2FkIHJldHVybmVkIHVuY2hhbmdlZDsgb25seSBwZXJzaXN0ZWQgcm93IGZhY3RzIGNhcHR1cmVkIGJ5IHdvcmtmbG93LW9ubHkgb2JzZXJ2ZXIiLAogICAgICAgICAgICB9CiAgICAgICAgICAgIG5hbWUgPSBpdGVtLm5hbWUucmVwbGFjZSgiWyIsICJfIikucmVwbGFjZSgiXSIsICIiKQogICAgICAgICAgICAoX2FydGlmYWN0cyAvICgicm91dGluZS1nYXAtIiArIG5hbWUgKyAiLmpzb24iKSkud3JpdGVfdGV4dChqc29uLmR1bXBzKHJlY2VpcHQsIGluZGVudD0yKSkKICAgICAgICByZXR1cm4gcmVzdWx0CiAgICBtb2R1bGUucmVsb2FkID0gb2JzZXJ2ZWRfcmVsb2FkCiAgICB0cnk6CiAgICAgICAgeWllbGQKICAgIGZpbmFsbHk6CiAgICAgICAgbW9kdWxlLnJlbG9hZCA9IG9yaWdpbmFsCg==''))
+
+        '
+    - name: Exact runtime timezone transition and400year future-tail preconditions
+      working-directory: backend
+      run: "uv run --no-sync python - <<'PROOF'\n\"\"\"Qualification-only TZif/future-tail audit. No private parser enters product code.\"\"\"\nimport datetime\n\
+        import hashlib\nimport json\nimport os\nimport pathlib\nfrom zoneinfo import available_timezones, _common, _tzpath, _zoneinfo, TZPATH\nimport tzdata\nimport\
+        \ tomllib\nlocked = next(p[\"version\"] for p in tomllib.loads(pathlib.Path(\"uv.lock\").read_text())[\"package\"] if p[\"name\"] == \"tzdata\")\nassert tzdata.__version__\
+        \ == locked\n\ndef check_assumptions(spacing, forward):\n    assert min(x[0] for x in spacing) > 48 * 3600\n    assert max(x[0] for x in forward) < 48 * 3600\n\
+        \n# The evaluator must reject a cancelling close transition or an overwide jump.\nfor bad_spacing, bad_forward in [([(3600,)], [(3600,)]), ([(604800,)], [(48\
+        \ * 3600,)])]:\n    try:\n        check_assumptions(bad_spacing, bad_forward)\n    except AssertionError:\n        pass\n    else:\n        raise AssertionError(\"\
+        Timezone precondition evaluator accepted an invalid window\")\n\nspacing = []\nforward = []\nzone_hashes = {}\ntail_zones = 0\nfuture_events = 0\nfor name\
+        \ in sorted(available_timezones()):\n    filename = _tzpath.find_tzfile(name)\n    if filename:\n        data = pathlib.Path(filename).read_bytes()\n    else:\n\
+        \        with _common.load_tzdata(name) as f:\n            data = f.read()\n    zone_hashes[name] = hashlib.sha256(data).hexdigest()\n    import io\n    indices,\
+        \ transitions, offsets, isdst, abbreviations, tail = _common.load_data(io.BytesIO(data))\n    events = list(zip(transitions, (offsets[i] for i in indices)))\n\
+        \    last_explicit = transitions[-1] if transitions else -(2**63)\n    if tail:\n        rule = _zoneinfo._parse_tz_str(tail.decode())\n        if hasattr(rule,\
+        \ \"transitions\"):\n            tail_zones += 1\n            start_year = max(2026, datetime.datetime.fromtimestamp(last_explicit, datetime.UTC).year) if\
+        \ transitions else 2026\n            # Gregorian weekdays and POSIX date rules repeat over 400 years.\n            # Include two extra years across each boundary\
+        \ of that complete cycle.\n            for year in range(start_year, start_year + 403):\n                start, end = rule.transitions(year)\n           \
+        \     std = int(rule.std.utcoff.total_seconds())\n                dst = int(rule.dst.utcoff.total_seconds())\n                for instant, offset in ((start\
+        \ - std, dst), (end - dst, std)):\n                    if instant > last_explicit:\n                        events.append((instant, offset))\n           \
+        \             future_events += 1\n    by_instant = {}\n    for instant, offset in events:\n        if instant in by_instant:\n            assert by_instant[instant]\
+        \ == offset, (name, instant, \"conflicting offset facts\")\n        by_instant[instant] = offset\n    changes = []\n    for instant, offset in sorted(by_instant.items()):\n\
+        \        if not changes or changes[-1][1] != offset:\n            changes.append((instant, offset))\n    for (a, before), (b, after) in zip(changes, changes[1:]):\n\
+        \        spacing.append((b - a, name, a, b))\n        if after > before:\n            forward.append((after - before, name, b))\nassert len(zone_hashes) >=\
+        \ 500\nassert spacing and forward and tail_zones > 100\nspacing.sort()\nforward.sort(reverse=True)\ncheck_assumptions(spacing, forward)\nreceipt = {\n   \
+        \ \"scope\": \"Actual runtime TZPATH plus package fallback; every available zone; explicit TZif transitions and full400-year POSIX future-rule cycle. Private\
+        \ Python parser used only in qualification.\",\n    \"tzpath\": list(TZPATH), \"packaged_tzdata_version\": tzdata.__version__,\n    \"zones\": len(zone_hashes),\
+        \ \"future_rule_zones\": tail_zones, \"future_transition_events\": future_events,\n    \"minimum_offset_transition_spacing_seconds\": spacing[0][0], \"shortest_examples\"\
+        : spacing[:10],\n    \"maximum_forward_shift_seconds\": forward[0][0], \"largest_examples\": forward[:10],\n    \"dataset_sha256\": hashlib.sha256(json.dumps(zone_hashes,\
+        \ sort_keys=True).encode()).hexdigest(),\n    \"all_zone_file_hashes\": zone_hashes, \"48h_endpoint_guard_preconditions\": \"PASS for exactly identified runtime\
+        \ dataset\",\n}\npathlib.Path(os.environ[\"RUNNER_TEMP\"], \"timezone-window-preconditions.json\").write_text(json.dumps(receipt, indent=2))\nprint(json.dumps({k:\
+        \ v for k, v in receipt.items() if k != \"all_zone_file_hashes\"}, indent=2))\nPROOF\n"
+    - name: Apply exact baseline packet
+      shell: python
+      run: 'import subprocess,pathlib,base64,hashlib
+
+        assert subprocess.check_output([''git'',''rev-parse'',''HEAD''],text=True).strip()==''c417f0987f709e703dd9e32727422f1bc99688a1''
+
+        subprocess.run([''git'',''reset'',''--hard'',''HEAD''],check=True)
+
+        p=base64.b64decode(''ZGlmZiAtLWdpdCBhL2JhY2tlbmQvdGVzdHMvc2VydmljZXMvdGVzdF9yb3V0aW5lX3NjaGVkdWxlLnB5IGIvYmFja2VuZC90ZXN0cy9zZXJ2aWNlcy90ZXN0X3JvdXRpbmVfc2NoZWR1bGUucHkKaW5kZXggYTE1ZWNmNDYxYzg4N2NlYTBlNjlhODgyNzNhZDZhMzdkZTg3YTdmMy4uOWE0OGI1ZWIzZGIwMjEwMWExNDI1MDhjNTk1MWM2ZWNhNGNjMmYzMiAxMDA2NDQKLS0tIGEvYmFja2VuZC90ZXN0cy9zZXJ2aWNlcy90ZXN0X3JvdXRpbmVfc2NoZWR1bGUucHkKKysrIGIvYmFja2VuZC90ZXN0cy9zZXJ2aWNlcy90ZXN0X3JvdXRpbmVfc2NoZWR1bGUucHkKQEAgLTE0NywzICsxNDcsMjAgQEAgZGVmIHRlc3RfbGF0ZXN0X2R1ZV9jb2xsYXBzZXNfYV9iYWNrbG9nKCk6CiApCiBkZWYgdGVzdF9jcm9uX3N1bW1hcmllcyhleHByZXNzaW9uLCB0ZXh0KToKICAgICBhc3NlcnQgcy5zdW1tYXJ5KCJjcm9uIiwgeyJleHByZXNzaW9uIjogZXhwcmVzc2lvbn0sICJVVEMiKSA9PSB0ZXh0CisKKworQHB5dGVzdC5tYXJrLnBhcmFtZXRyaXplKCJ6b25lLGV4cHJlc3Npb24sYWZ0ZXIsZXhwZWN0ZWQiLCBbCisgICAgKCJBdXN0cmFsaWEvTG9yZF9Ib3dlIiwgIjE1IDIgKiAqICoiLCAiMjAyNi0xMC0wM1QxNTozMDowMCswMDowMCIsICIyMDI2LTEwLTAzVDE1OjQ1OjAwKzAwOjAwIiksCisgICAgKCJBdXN0cmFsaWEvTG9yZF9Ib3dlIiwgIjE1IDIgKiAqICoiLCAiMjAyNi0xMC0wM1QxNTo0NDo1OSswMDowMCIsICIyMDI2LTEwLTAzVDE1OjQ1OjAwKzAwOjAwIiksCisgICAgKCJBdXN0cmFsaWEvTG9yZF9Ib3dlIiwgIjE1IDIgKiAqICoiLCAiMjAyNi0xMC0wM1QxNTo0NTowMCswMDowMCIsICIyMDI2LTEwLTA0VDE1OjE1OjAwKzAwOjAwIiksCisgICAgKCJQYWNpZmljL0FwaWEiLCAiMCAxMiAqICogNSIsICIyMDExLTEyLTMwVDEwOjAwOjAwKzAwOjAwIiwgIjIwMTEtMTItMzBUMjI6MDA6MDArMDA6MDAiKSwKKyAgICAoIlBhY2lmaWMvQXBpYSIsICIwIDEyICogKiA1IiwgIjIwMTEtMTItMzBUMjI6MDA6MDArMDA6MDAiLCAiMjAxMi0wMS0wNVQyMjowMDowMCswMDowMCIpLAorICAgICgiRXVyb3BlL0JlcmxpbiIsICIzMCAyICogKiAxIiwgIjIwMjYtMDMtMjlUMDE6MDA6MDArMDA6MDAiLCAiMjAyNi0wMy0zMFQwMDozMDowMCswMDowMCIpLAorICAgICgiRXVyb3BlL0JlcmxpbiIsICIzMCAyICogKiAwIiwgIjIwMjYtMDMtMjlUMDE6MDA6MDArMDA6MDAiLCAiMjAyNi0wMy0yOVQwMTozMDowMCswMDowMCIpLAorICAgICgiRXVyb3BlL0JlcmxpbiIsICIqLzE1IDEsMiAqICogKiIsICIyMDI2LTAzLTI5VDAxOjA1OjAwKzAwOjAwIiwgIjIwMjYtMDMtMjlUMDE6MTU6MDArMDA6MDAiKSwKKyAgICAoIkV1cm9wZS9CZXJsaW4iLCAiKiAqICogKiAqIiwgIjIwMjYtMDMtMjlUMDE6MDU6MDArMDA6MDAiLCAiMjAyNi0wMy0yOVQwMTowNjowMCswMDowMCIpLAorXSwgaWRzPVsibG9yZC1ob3dlLXRyYW5zaXRpb24iLCAibG9yZC1ob3dlLWJlZm9yZS1jYXJyaWVkIiwgImxvcmQtaG93ZS1zdHJpY3QiLCAiYXBpYS1za2lwcGVkLWZyaWRheSIsICJhcGlhLXN0cmljdCIsICJub25zZWxlY3RlZC1tb25kYXkiLCAic2VsZWN0ZWQtc3VuZGF5IiwgIm11bHRpLWhvdXItY3JvbiIsICJkZW5zZS1jcm9uIl0sIGlkcz1bImxvcmQtaG93ZS10cmFuc2l0aW9uIiwgImxvcmQtaG93ZS1iZWZvcmUtY2FycmllZCIsICJsb3JkLWhvd2Utc3RyaWN0IiwgImFwaWEtc2tpcHBlZC1mcmlkYXkiLCAiYXBpYS1zdHJpY3QiLCAibm9uc2VsZWN0ZWQtbW9uZGF5IiwgInNlbGVjdGVkLXN1bmRheSIsICJtdWx0aS1ob3VyLWNyb24iLCAiZGVuc2UtY3JvbiJdKQorZGVmIHRlc3RfbmV4dF9hZnRlcl9yZXRhaW5zX2NhcnJpZWRfZ2FwX29jY3VycmVuY2VzKHpvbmUsIGV4cHJlc3Npb24sIGFmdGVyLCBleHBlY3RlZCk6CisgICAgbm93ID0gZGF0ZXRpbWUuZnJvbWlzb2Zvcm1hdChhZnRlcikKKyAgICBzcGVjID0gcy5ub3JtYWxpemUoImNyb24iLCB7ImV4cHJlc3Npb24iOiBleHByZXNzaW9ufSwgem9uZSwgbm93PW5vdykKKyAgICBhc3NlcnQgcy5uZXh0X2FmdGVyKCJjcm9uIiwgc3BlYywgem9uZSwgbm93KSA9PSBkYXRldGltZS5mcm9taXNvZm9ybWF0KGV4cGVjdGVkKQpkaWZmIC0tZ2l0IGEvYmFja2VuZC90ZXN0cy9zZXJ2aWNlcy90ZXN0X3JvdXRpbmVfc2VydmljZS5weSBiL2JhY2tlbmQvdGVzdHMvc2VydmljZXMvdGVzdF9yb3V0aW5lX3NlcnZpY2UucHkKaW5kZXggYWFjNWFkYTUyOGQzMjM1YWU1NzdhNmU2ZjI1YzhmN2RmMmZiZTAzYS4uZDBkMTIwZjM2YTI3ZDMwODlhZmE0ZTc4N2EzZWMxNjk5NWYwNGRjYSAxMDA2NDQKLS0tIGEvYmFja2VuZC90ZXN0cy9zZXJ2aWNlcy90ZXN0X3JvdXRpbmVfc2VydmljZS5weQorKysgYi9iYWNrZW5kL3Rlc3RzL3NlcnZpY2VzL3Rlc3Rfcm91dGluZV9zZXJ2aWNlLnB5CkBAIC00MzgsMyArNDM4LDIxIEBAIGFzeW5jIGRlZiB0ZXN0X2FuX2ltcG9ydGVkX3JvdXRpbmVfaXNfcGF1c2VkX2FuZF9oYXNfbm9fd2ViaG9vayhzZXNzaW9ucywgb3duZXIsCiAgICAgICAgIGltcG9ydGVkID0gYXdhaXQgc2VydmljZS5pbXBvcnRfZG9jdW1lbnQoZGIsIG93bmVyLCBhZ2VudC5pZCwgZG9jdW1lbnQsIG5vdz1jbG9jaygpKQogICAgIGFzc2VydCBpbXBvcnRlZC5wYXVzZWQgYW5kIGltcG9ydGVkLm5leHRfcnVuX2F0IGlzIE5vbmUgYW5kIGltcG9ydGVkLndlYmhvb2tfc2VjcmV0X2hhc2ggaXMgTm9uZQogICAgIGFzc2VydCBpbXBvcnRlZC5zY2hlZHVsZV9zcGVjID09IHsiZXhwcmVzc2lvbiI6ICIqICogKiAqICoifQorCisKK0BweXRlc3QubWFyay5wYXJhbWV0cml6ZSgiYWZ0ZXIsIGV4cGVjdGVkIiwgWworICAgICgiMjAyNi0wMy0yOVQwMDo1NTowMCswMDowMCIsICIyMDI2LTAzLTI5VDAxOjMwOjAwKzAwOjAwIiksCisgICAgKCIyMDI2LTAzLTI5VDAxOjAwOjAwKzAwOjAwIiwgIjIwMjYtMDMtMjlUMDE6MzA6MDArMDA6MDAiKSwKKyAgICAoIjIwMjYtMDMtMjlUMDE6Mjk6MDArMDA6MDAiLCAiMjAyNi0wMy0yOVQwMTozMDowMCswMDowMCIpLAorICAgICgiMjAyNi0wMy0yOVQwMTozMDowMCswMDowMCIsICIyMDI2LTAzLTMwVDAwOjMwOjAwKzAwOjAwIiksCisgICAgKCIyMDI2LTAzLTMwVDAxOjAwOjAwKzAwOjAwIiwgIjIwMjYtMDMtMzFUMDA6MzA6MDArMDA6MDAiKSwKK10sIGlkcz1bImJlZm9yZS10cmFuc2l0aW9uIiwgInRyYW5zaXRpb24tY29tcGxldGUiLCAiYmVmb3JlLWNhcnJpZWQtdGltZSIsICJzdHJpY3QtYWZ0ZXItY2FycmllZC10aW1lIiwgIm9yZGluYXJ5LWRheSJdKQorYXN5bmMgZGVmIHRlc3RfcmV2aWV3X2dhcF9jcmVhdGlvbl9rZWVwc19kb2N1bWVudGVkX3NoaWZ0ZWRfb2NjdXJyZW5jZShzZXNzaW9ucywgb3duZXIsIGFnZW50LCBjbG9jaywgYWZ0ZXIsIGV4cGVjdGVkKToKKyAgICBmcm9tIHpvbmVpbmZvIGltcG9ydCBab25lSW5mbworICAgIGNsb2NrLm5vdyA9IGRhdGV0aW1lLmZyb21pc29mb3JtYXQoYWZ0ZXIpCisgICAgcm91dGluZSA9IGF3YWl0IG1ha2Vfcm91dGluZShzZXNzaW9ucywgb3duZXIsIGFnZW50LCBjbG9jaywgc2NoZWR1bGVfa2luZD0id2Vla2RheXMiLCBzY2hlZHVsZV9zcGVjPXsiZGF5cyI6IGxpc3QocmFuZ2UoNykpLCAidGltZSI6ICIwMjozMCJ9LCB0aW1lem9uZT0iRXVyb3BlL0JlcmxpbiIpCisgICAgcmVmcmVzaGVkID0gYXdhaXQgcmVsb2FkKHNlc3Npb25zLCBSb3V0aW5lLCByb3V0aW5lLmlkKQorICAgIGV4cGVjdGVkX2F0ID0gZGF0ZXRpbWUuZnJvbWlzb2Zvcm1hdChleHBlY3RlZCkKKyAgICBpZiBleHBlY3RlZF9hdC5kYXRlKCkuaXNvZm9ybWF0KCkgPT0gIjIwMjYtMDMtMjkiOgorICAgICAgICBhc3NlcnQgZXhwZWN0ZWRfYXQuYXN0aW1lem9uZShab25lSW5mbygiRXVyb3BlL0JlcmxpbiIpKS5zdHJmdGltZSgiJUg6JU0iKSA9PSAiMDM6MzAiCisgICAgYXNzZXJ0IHJlZnJlc2hlZC5uZXh0X3J1bl9hdCA9PSBleHBlY3RlZF9hdAo='')
+
+        assert hashlib.sha256(p).hexdigest()==''16a5e65e21212048a1654bf4568d5356f61b8845972edf107a575c25da464074''
+
+        subprocess.run([''git'',''apply'',''-''],input=p,check=True)
+
+        pathlib.Path(''/tmp/dst-expected.patch'').write_bytes(p)
+
+        '
+    - name: baseline source guard before
+      shell: python
+      env:
+        POINT: before
+      run: 'import subprocess,pathlib,hashlib,json,os
+
+        a=subprocess.check_output([''git'',''diff'',''--full-index'',''--binary'',''HEAD''])
+
+        assert a==pathlib.Path(''/tmp/dst-expected.patch'').read_bytes()
+
+        assert hashlib.sha256(a).hexdigest()==''16a5e65e21212048a1654bf4568d5356f61b8845972edf107a575c25da464074''
+
+        pathlib.Path(os.environ[''RUNNER_TEMP''], ''source-''+''baseline''+''-''+os.environ[''POINT'']+''.json'').write_text(json.dumps({''head'':subprocess.check_output([''git'',''rev-parse'',''HEAD''],text=True).strip(),''patch_sha256'':hashlib.sha256(a).hexdigest()}))
+
+        '
+    - name: baseline actual calendar regressions and controls
+      id: baseline_calendar
+      continue-on-error: true
+      working-directory: backend
+      run: PYTHONPATH="$RUNNER_TEMP/proof-observer:$PWD" PROOF_ARTIFACT_DIR="$RUNNER_TEMP" env -u RUNNER_TEMP uv run --no-sync pytest -p observe_sqlite -q tests/services/test_routine_schedule.py
+        --junitxml="$RUNNER_TEMP/baseline-calendar.xml"
+    - name: baseline actual sqlite regressions and controls
+      id: baseline_sqlite
+      continue-on-error: true
+      working-directory: backend
+      run: PYTHONPATH="$RUNNER_TEMP/proof-observer:$PWD" PROOF_ARTIFACT_DIR="$RUNNER_TEMP" env -u RUNNER_TEMP uv run --no-sync pytest -p observe_sqlite -q tests/services/test_routine_service.py
+        -k test_review_gap_creation_keeps_documented_shifted_occurrence --junitxml="$RUNNER_TEMP/baseline-sqlite.xml"
+    - name: Exact baseline complete case identity and result oracle
+      shell: python
+      run: 'import pathlib,os,xml.etree.ElementTree as E,json
+
+        p=pathlib.Path(os.environ[''RUNNER_TEMP'']);r={}
+
+        root=E.parse(p/''baseline-calendar.xml'').getroot();cs=list(root.iter(''testcase''));assert not list(root.iter(''skipped'')) and not list(root.iter(''error''));r[''calendar'']={c.attrib[''name'']:c.find(''failure'')
+        is not None for c in cs}
+
+        root=E.parse(p/''baseline-sqlite.xml'').getroot();cs=list(root.iter(''testcase''));assert not list(root.iter(''skipped'')) and not list(root.iter(''error''));r[''sqlite'']={c.attrib[''name'']:c.find(''failure'')
+        is not None for c in cs}
+
+        assert {''test_next_after_retains_carried_gap_occurrences[''+i+'']'' for i in [''lord-howe-transition'', ''lord-howe-before-carried'', ''lord-howe-strict'',
+        ''apia-skipped-friday'', ''apia-strict'', ''nonselected-monday'', ''selected-sunday'', ''multi-hour-cron'', ''dense-cron'']} <= set(r[''calendar''])
+
+        assert set(r[''sqlite''])=={''test_review_gap_creation_keeps_documented_shifted_occurrence[''+i+'']'' for i in [''before-transition'',''transition-complete'',''before-carried-time'',''strict-after-carried-time'',''ordinary-day'']}
+
+        assert {n for n,f in r[''calendar''].items() if f}=={''test_next_after_retains_carried_gap_occurrences[''+i+'']'' for i in [''lord-howe-transition'', ''lord-howe-before-carried'',
+        ''apia-skipped-friday'', ''selected-sunday'', ''multi-hour-cron'']}
+
+        assert {n for n,f in r[''sqlite''].items() if f}=={''test_review_gap_creation_keeps_documented_shifted_occurrence[transition-complete]'',''test_review_gap_creation_keeps_documented_shifted_occurrence[before-carried-time]''}
+
+        print(json.dumps(r,indent=2))
+
+        '
+    - name: baseline bounded dense cost observation
+      working-directory: backend
+      env:
+        CANDIDATE_PHASE: baseline
+      run: "uv run --no-sync python - <<'MEASURE'\n\"\"\"Observed CPU time and exact real-trigger calls, separate from functional gates.\"\"\"\nimport datetime\n\
+        import json\nimport os\nimport pathlib\nimport statistics\nimport time\nfrom app.services import routine_schedule as s\n\noriginal = s._crontab_trigger\n\
+        counter = [0]\nclass CountedTrigger:\n    def __init__(self, trigger):\n        self.trigger = trigger\n    def get_next_fire_time(self, *args):\n       \
+        \ counter[0] += 1\n        return self.trigger.get_next_fire_time(*args)\ndef counted(*args):\n    return CountedTrigger(original(*args))\ns._crontab_trigger\
+        \ = counted\nrows = []\nfor label, zone, expression, after in [\n    (\"ordinary-dense\", \"UTC\", \"* * * * *\", \"2026-10-20T12:00:20+00:00\"),\n    (\"\
+        berlin-dense-gap\", \"Europe/Berlin\", \"* * * * *\", \"2026-03-29T01:05:00+00:00\"),\n    (\"lord-howe-half-hour\", \"Australia/Lord_Howe\", \"15 2 * * *\"\
+        , \"2026-10-03T15:30:00+00:00\"),\n    (\"apia-expired-dense-window\", \"Pacific/Apia\", \"* * * * *\", \"2011-12-31T22:00:00+00:00\"),\n]:\n    times, calls,\
+        \ results = [], [], []\n    for _ in range(10):\n        counter[0] = 0\n        start = time.perf_counter()\n        result = s.next_after(\"cron\", {\"\
+        expression\": expression}, zone, datetime.datetime.fromisoformat(after))\n        times.append((time.perf_counter() - start) * 1000)\n        calls.append(counter[0])\n\
+        \        results.append(result.isoformat() if result else None)\n    assert len(set(results)) == 1\n    assert max(calls) <= 48 * 60 + 3, (label, calls)\n\
+        \    rows.append({\"case\": label, \"median_ms\": statistics.median(times), \"max_ms\": max(times), \"real_trigger_calls\": calls, \"next\": results[0]})\n\
+        pathlib.Path(os.environ[\"RUNNER_TEMP\"], \"cost-\" + os.environ[\"CANDIDATE_PHASE\"] + \".json\").write_text(json.dumps(rows, indent=2))\nprint(json.dumps(rows,\
+        \ indent=2))\nMEASURE\n"
+    - name: baseline source guard after
+      if: always()
+      shell: python
+      env:
+        POINT: after
+      run: 'import subprocess,pathlib,hashlib,json,os
+
+        a=subprocess.check_output([''git'',''diff'',''--full-index'',''--binary'',''HEAD''])
+
+        assert a==pathlib.Path(''/tmp/dst-expected.patch'').read_bytes()
+
+        assert hashlib.sha256(a).hexdigest()==''16a5e65e21212048a1654bf4568d5356f61b8845972edf107a575c25da464074''
+
+        pathlib.Path(os.environ[''RUNNER_TEMP''], ''source-''+''baseline''+''-''+os.environ[''POINT'']+''.json'').write_text(json.dumps({''head'':subprocess.check_output([''git'',''rev-parse'',''HEAD''],text=True).strip(),''patch_sha256'':hashlib.sha256(a).hexdigest()}))
+
+        '
+    - name: Preserve actual SQLite semantic receipts baseline
+      shell: python
+      run: 'import pathlib,os
+
+        p=pathlib.Path(os.environ[''RUNNER_TEMP'']);[(f.rename(p/(''baseline-''+f.name))) for f in p.glob(''routine-gap-*.json'')]'
+    - name: Apply exact candidate packet
+      shell: python
+      run: 'import subprocess,pathlib,base64,hashlib
+
+        assert subprocess.check_output([''git'',''rev-parse'',''HEAD''],text=True).strip()==''c417f0987f709e703dd9e32727422f1bc99688a1''
+
+        subprocess.run([''git'',''reset'',''--hard'',''HEAD''],check=True)
+
+        p=base64.b64decode(''ZGlmZiAtLWdpdCBhL2JhY2tlbmQvYXBwL3NlcnZpY2VzL3JvdXRpbmVfc2NoZWR1bGUucHkgYi9iYWNrZW5kL2FwcC9zZXJ2aWNlcy9yb3V0aW5lX3NjaGVkdWxlLnB5CmluZGV4IGFmOWJmMzliMDcyZGI1Mzg3N2IxNzRhMmNlYmQ1N2VhZjAzZjc3NDguLmE3NmFhYjNlZDg1NGE1YjI2NDc2YTUxYWY0YWYxMTVlYmM1MDllNTkgMTAwNjQ0Ci0tLSBhL2JhY2tlbmQvYXBwL3NlcnZpY2VzL3JvdXRpbmVfc2NoZWR1bGUucHkKKysrIGIvYmFja2VuZC9hcHAvc2VydmljZXMvcm91dGluZV9zY2hlZHVsZS5weQpAQCAtMTIyLDYgKzEyMiwzNyBAQCBkZWYgX3NlY29uZF9vZl9yZXBlYXRlZF9ob3VyKG1vbWVudDogZGF0ZXRpbWUsIHR6OiBab25lSW5mbykgLT4gYm9vbDoKICAgICByZXR1cm4gbG9jYWwudXRjb2Zmc2V0KCkgPT0gc2Vjb25kLnV0Y29mZnNldCgpCiAKIAorZGVmIF9jYXJyaWVkX2dhcF9hZnRlcihleHByZXNzaW9uOiBzdHIsIHR6OiBab25lSW5mbywgYWZ0ZXI6IGRhdGV0aW1lKSAtPiBkYXRldGltZSB8IE5vbmU6CisgICAgIiIiRmluZCBhIHN0aWxsLWZ1dHVyZSBvY2N1cnJlbmNlIGZyb20gYSByZWNlbnQgc2tpcHBlZCB3YWxsLWNsb2NrIGludGVydmFsLiIiIgorICAgICMgVVRDIG9mZnNldHMgYXJlIGxlc3MgdGhhbiAyNCBob3VycyBpbiBtYWduaXR1ZGUsIHNvIGEgZ2FwJ3MgY2FycmllZAorICAgICMgb2NjdXJyZW5jZSBjYW5ub3QgcmVtYWluIGZ1dHVyZSBmb3IgNDggaG91cnMuIFRoZSBzdXBwb3J0ZWQgSUFOQSBkYXRhc2V0CisgICAgIyBoYXMgbm8gb2Zmc2V0IHRyYW5zaXRpb25zIGNsb3NlciB0aGFuIHRoaXMgd2luZG93IChjaGVja2VkIGluIHF1YWxpZmljYXRpb24pLgorICAgIGxvY2FsX25vdyA9IGFmdGVyLmFzdGltZXpvbmUodHopCisgICAgcHJldmlvdXMgPSAoYWZ0ZXIgLSB0aW1lZGVsdGEoaG91cnM9NDgpKS5hc3RpbWV6b25lKHR6KQorICAgIGNoYW5nZSA9IGxvY2FsX25vdy51dGNvZmZzZXQoKSAtIHByZXZpb3VzLnV0Y29mZnNldCgpCisgICAgaWYgY2hhbmdlIDw9IHRpbWVkZWx0YSgwKToKKyAgICAgICAgcmV0dXJuIE5vbmUKKworICAgICMgRXZhbHVhdGUgdGhlIHNhbWUgY2FsZW5kYXIgZmllbGRzIGluIFVUQyB0byB3YWxrIHRoZSBtaXNzaW5nICp3YWxsKgorICAgICMgdGltZXMuIFdhbGtpbmcgaW4gdGhlIHJlYWwgem9uZSB3b3VsZCBub3JtYWxpemUgaW50byB0aGUgcG9zdC1nYXAgaG91cgorICAgICMgYW5kIGxvc2UgdGhlIHJlbWFpbmluZyBpbWFnaW5hcnkgdGltZXMgYWdhaW4uCisgICAgd2FsbF9lbmQgPSBsb2NhbF9ub3cucmVwbGFjZSh0emluZm89VVRDKQorICAgIGN1cnNvciA9IHdhbGxfZW5kIC0gY2hhbmdlCisgICAgc2hhZG93ID0gX2Nyb250YWJfdHJpZ2dlcihleHByZXNzaW9uLCBab25lSW5mbygiVVRDIikpCisgICAgIyBGaXZlLWZpZWxkIGNyb24gY2FuIG1hdGNoIGF0IG1vc3Qgb25jZSBhIG1pbnV0ZSBpbiB0aGlzIDw0OC1ob3VyIHdpbmRvdy4KKyAgICBmb3IgXyBpbiByYW5nZSg0OCAqIDYwICsgMSk6CisgICAgICAgIHdhbGwgPSBzaGFkb3cuZ2V0X25leHRfZmlyZV90aW1lKE5vbmUsIGN1cnNvcikKKyAgICAgICAgaWYgd2FsbCBpcyBOb25lIG9yIHdhbGwgPiB3YWxsX2VuZDoKKyAgICAgICAgICAgIHJldHVybiBOb25lCisgICAgICAgIG5haXZlID0gd2FsbC5yZXBsYWNlKHR6aW5mbz1Ob25lKQorICAgICAgICBjYXJyaWVkID0gbmFpdmUucmVwbGFjZSh0emluZm89dHosIGZvbGQ9MCkuYXN0aW1lem9uZShVVEMpCisgICAgICAgIHJvdW5kdHJpcCA9IGNhcnJpZWQuYXN0aW1lem9uZSh0eikucmVwbGFjZSh0emluZm89Tm9uZSkKKyAgICAgICAgaWYgcm91bmR0cmlwID4gbmFpdmUgYW5kIGNhcnJpZWQgPiBhZnRlcjoKKyAgICAgICAgICAgIHJldHVybiBjYXJyaWVkCisgICAgICAgIGN1cnNvciA9IHdhbGwgKyB0aW1lZGVsdGEobWljcm9zZWNvbmRzPTEpCisgICAgcmFpc2UgSW52YWxpZFNjaGVkdWxlKCJUaGUgY2xvY2stY2hhbmdlIHNlYXJjaCBleGNlZWRlZCBpdHMgYm91bmRlZCB3aW5kb3ciKQorCisKIGRlZiBuZXh0X2FmdGVyKGtpbmQ6IHN0ciwgc3BlYzogZGljdCwgdGltZXpvbmU6IHN0ciwgYWZ0ZXI6IGRhdGV0aW1lKSAtPiBkYXRldGltZSB8IE5vbmU6CiAgICAgIiIiVGhlIGZpcnN0IG9jY3VycmVuY2Ugc3RyaWN0bHkgYWZ0ZXIgYGFmdGVyYCAoVVRDKSwgb3IgTm9uZSBpZiB0aGVyZSBpcyBub25lLiIiIgogICAgIGFmdGVyID0gYWZ0ZXIuYXN0aW1lem9uZShVVEMpCkBAIC0xMzgsMTggKzE2OSwyMCBAQCBkZWYgbmV4dF9hZnRlcihraW5kOiBzdHIsIHNwZWM6IGRpY3QsIHRpbWV6b25lOiBzdHIsIGFmdGVyOiBkYXRldGltZSkgLT4gZGF0ZXRpbQogICAgICAgICAgICAgcmV0dXJuIGFuY2hvcgogICAgICAgICBlbGFwc2VkID0gKGFmdGVyIC0gYW5jaG9yKSAvLyBzdGVwCiAgICAgICAgIHJldHVybiBhbmNob3IgKyAoZWxhcHNlZCArIDEpICogc3RlcAotICAgIHRyaWdnZXIgPSBfY3JvbnRhYl90cmlnZ2VyKF9jcm9uX2V4cHJlc3Npb24oa2luZCwgc3BlYyksIHR6KQorICAgIGV4cHJlc3Npb24gPSBfY3Jvbl9leHByZXNzaW9uKGtpbmQsIHNwZWMpCisgICAgY2FycmllZCA9IF9jYXJyaWVkX2dhcF9hZnRlcihleHByZXNzaW9uLCB0eiwgYWZ0ZXIpCisgICAgdHJpZ2dlciA9IF9jcm9udGFiX3RyaWdnZXIoZXhwcmVzc2lvbiwgdHopCiAgICAgY3Vyc29yID0gYWZ0ZXIKICAgICBmb3IgXyBpbiByYW5nZShfTUFYX1NLSVBTKToKICAgICAgICAgIyBnZXRfbmV4dF9maXJlX3RpbWUgaXMgaW5jbHVzaXZlIG9mIGl0cyBgbm93YDsgbnVkZ2UgcGFzdCBpdC4KICAgICAgICAgY2FuZGlkYXRlID0gdHJpZ2dlci5nZXRfbmV4dF9maXJlX3RpbWUoTm9uZSwgY3Vyc29yICsgdGltZWRlbHRhKG1pY3Jvc2Vjb25kcz0xKSkKICAgICAgICAgaWYgY2FuZGlkYXRlIGlzIE5vbmU6Ci0gICAgICAgICAgICByZXR1cm4gTm9uZQorICAgICAgICAgICAgcmV0dXJuIGNhcnJpZWQKICAgICAgICAgY2FuZGlkYXRlID0gY2FuZGlkYXRlLmFzdGltZXpvbmUoVVRDKQogICAgICAgICBpZiBub3QgX3NlY29uZF9vZl9yZXBlYXRlZF9ob3VyKGNhbmRpZGF0ZSwgdHopOgotICAgICAgICAgICAgcmV0dXJuIGNhbmRpZGF0ZQorICAgICAgICAgICAgcmV0dXJuIG1pbihjYW5kaWRhdGUsIGNhcnJpZWQpIGlmIGNhcnJpZWQgaXMgbm90IE5vbmUgZWxzZSBjYW5kaWRhdGUKICAgICAgICAgY3Vyc29yID0gY2FuZGlkYXRlCi0gICAgcmV0dXJuIE5vbmUKKyAgICByZXR1cm4gY2FycmllZAogCiAKIGRlZiBuZXh0X2RhdGVzKGtpbmQ6IHN0ciwgc3BlYzogZGljdCwgdGltZXpvbmU6IHN0ciwgYWZ0ZXI6IGRhdGV0aW1lLCBjb3VudDogaW50ID0gMykgLT4gbGlzdFtkYXRldGltZV06CmRpZmYgLS1naXQgYS9iYWNrZW5kL3Rlc3RzL3NlcnZpY2VzL3Rlc3Rfcm91dGluZV9zY2hlZHVsZS5weSBiL2JhY2tlbmQvdGVzdHMvc2VydmljZXMvdGVzdF9yb3V0aW5lX3NjaGVkdWxlLnB5CmluZGV4IGExNWVjZjQ2MWM4ODdjZWEwZTY5YTg4MjczYWQ2YTM3ZGU4N2E3ZjMuLjlhNDhiNWViM2RiMDIxMDFhMTQyNTA4YzU5NTFjNmVjYTRjYzJmMzIgMTAwNjQ0Ci0tLSBhL2JhY2tlbmQvdGVzdHMvc2VydmljZXMvdGVzdF9yb3V0aW5lX3NjaGVkdWxlLnB5CisrKyBiL2JhY2tlbmQvdGVzdHMvc2VydmljZXMvdGVzdF9yb3V0aW5lX3NjaGVkdWxlLnB5CkBAIC0xNDcsMyArMTQ3LDIwIEBAIGRlZiB0ZXN0X2xhdGVzdF9kdWVfY29sbGFwc2VzX2FfYmFja2xvZygpOgogKQogZGVmIHRlc3RfY3Jvbl9zdW1tYXJpZXMoZXhwcmVzc2lvbiwgdGV4dCk6CiAgICAgYXNzZXJ0IHMuc3VtbWFyeSgiY3JvbiIsIHsiZXhwcmVzc2lvbiI6IGV4cHJlc3Npb259LCAiVVRDIikgPT0gdGV4dAorCisKK0BweXRlc3QubWFyay5wYXJhbWV0cml6ZSgiem9uZSxleHByZXNzaW9uLGFmdGVyLGV4cGVjdGVkIiwgWworICAgICgiQXVzdHJhbGlhL0xvcmRfSG93ZSIsICIxNSAyICogKiAqIiwgIjIwMjYtMTAtMDNUMTU6MzA6MDArMDA6MDAiLCAiMjAyNi0xMC0wM1QxNTo0NTowMCswMDowMCIpLAorICAgICgiQXVzdHJhbGlhL0xvcmRfSG93ZSIsICIxNSAyICogKiAqIiwgIjIwMjYtMTAtMDNUMTU6NDQ6NTkrMDA6MDAiLCAiMjAyNi0xMC0wM1QxNTo0NTowMCswMDowMCIpLAorICAgICgiQXVzdHJhbGlhL0xvcmRfSG93ZSIsICIxNSAyICogKiAqIiwgIjIwMjYtMTAtMDNUMTU6NDU6MDArMDA6MDAiLCAiMjAyNi0xMC0wNFQxNToxNTowMCswMDowMCIpLAorICAgICgiUGFjaWZpYy9BcGlhIiwgIjAgMTIgKiAqIDUiLCAiMjAxMS0xMi0zMFQxMDowMDowMCswMDowMCIsICIyMDExLTEyLTMwVDIyOjAwOjAwKzAwOjAwIiksCisgICAgKCJQYWNpZmljL0FwaWEiLCAiMCAxMiAqICogNSIsICIyMDExLTEyLTMwVDIyOjAwOjAwKzAwOjAwIiwgIjIwMTItMDEtMDVUMjI6MDA6MDArMDA6MDAiKSwKKyAgICAoIkV1cm9wZS9CZXJsaW4iLCAiMzAgMiAqICogMSIsICIyMDI2LTAzLTI5VDAxOjAwOjAwKzAwOjAwIiwgIjIwMjYtMDMtMzBUMDA6MzA6MDArMDA6MDAiKSwKKyAgICAoIkV1cm9wZS9CZXJsaW4iLCAiMzAgMiAqICogMCIsICIyMDI2LTAzLTI5VDAxOjAwOjAwKzAwOjAwIiwgIjIwMjYtMDMtMjlUMDE6MzA6MDArMDA6MDAiKSwKKyAgICAoIkV1cm9wZS9CZXJsaW4iLCAiKi8xNSAxLDIgKiAqICoiLCAiMjAyNi0wMy0yOVQwMTowNTowMCswMDowMCIsICIyMDI2LTAzLTI5VDAxOjE1OjAwKzAwOjAwIiksCisgICAgKCJFdXJvcGUvQmVybGluIiwgIiogKiAqICogKiIsICIyMDI2LTAzLTI5VDAxOjA1OjAwKzAwOjAwIiwgIjIwMjYtMDMtMjlUMDE6MDY6MDArMDA6MDAiKSwKK10sIGlkcz1bImxvcmQtaG93ZS10cmFuc2l0aW9uIiwgImxvcmQtaG93ZS1iZWZvcmUtY2FycmllZCIsICJsb3JkLWhvd2Utc3RyaWN0IiwgImFwaWEtc2tpcHBlZC1mcmlkYXkiLCAiYXBpYS1zdHJpY3QiLCAibm9uc2VsZWN0ZWQtbW9uZGF5IiwgInNlbGVjdGVkLXN1bmRheSIsICJtdWx0aS1ob3VyLWNyb24iLCAiZGVuc2UtY3JvbiJdLCBpZHM9WyJsb3JkLWhvd2UtdHJhbnNpdGlvbiIsICJsb3JkLWhvd2UtYmVmb3JlLWNhcnJpZWQiLCAibG9yZC1ob3dlLXN0cmljdCIsICJhcGlhLXNraXBwZWQtZnJpZGF5IiwgImFwaWEtc3RyaWN0IiwgIm5vbnNlbGVjdGVkLW1vbmRheSIsICJzZWxlY3RlZC1zdW5kYXkiLCAibXVsdGktaG91ci1jcm9uIiwgImRlbnNlLWNyb24iXSkKK2RlZiB0ZXN0X25leHRfYWZ0ZXJfcmV0YWluc19jYXJyaWVkX2dhcF9vY2N1cnJlbmNlcyh6b25lLCBleHByZXNzaW9uLCBhZnRlciwgZXhwZWN0ZWQpOgorICAgIG5vdyA9IGRhdGV0aW1lLmZyb21pc29mb3JtYXQoYWZ0ZXIpCisgICAgc3BlYyA9IHMubm9ybWFsaXplKCJjcm9uIiwgeyJleHByZXNzaW9uIjogZXhwcmVzc2lvbn0sIHpvbmUsIG5vdz1ub3cpCisgICAgYXNzZXJ0IHMubmV4dF9hZnRlcigiY3JvbiIsIHNwZWMsIHpvbmUsIG5vdykgPT0gZGF0ZXRpbWUuZnJvbWlzb2Zvcm1hdChleHBlY3RlZCkKZGlmZiAtLWdpdCBhL2JhY2tlbmQvdGVzdHMvc2VydmljZXMvdGVzdF9yb3V0aW5lX3NlcnZpY2UucHkgYi9iYWNrZW5kL3Rlc3RzL3NlcnZpY2VzL3Rlc3Rfcm91dGluZV9zZXJ2aWNlLnB5CmluZGV4IGFhYzVhZGE1MjhkMzIzNWFlNTc3YTZlNmYyNWM4ZjdkZjJmYmUwM2EuLmQwZDEyMGYzNmEyN2QzMDg5YWZhNGU3ODdhM2VjMTY5OTVmMDRkY2EgMTAwNjQ0Ci0tLSBhL2JhY2tlbmQvdGVzdHMvc2VydmljZXMvdGVzdF9yb3V0aW5lX3NlcnZpY2UucHkKKysrIGIvYmFja2VuZC90ZXN0cy9zZXJ2aWNlcy90ZXN0X3JvdXRpbmVfc2VydmljZS5weQpAQCAtNDM4LDMgKzQzOCwyMSBAQCBhc3luYyBkZWYgdGVzdF9hbl9pbXBvcnRlZF9yb3V0aW5lX2lzX3BhdXNlZF9hbmRfaGFzX25vX3dlYmhvb2soc2Vzc2lvbnMsIG93bmVyLAogICAgICAgICBpbXBvcnRlZCA9IGF3YWl0IHNlcnZpY2UuaW1wb3J0X2RvY3VtZW50KGRiLCBvd25lciwgYWdlbnQuaWQsIGRvY3VtZW50LCBub3c9Y2xvY2soKSkKICAgICBhc3NlcnQgaW1wb3J0ZWQucGF1c2VkIGFuZCBpbXBvcnRlZC5uZXh0X3J1bl9hdCBpcyBOb25lIGFuZCBpbXBvcnRlZC53ZWJob29rX3NlY3JldF9oYXNoIGlzIE5vbmUKICAgICBhc3NlcnQgaW1wb3J0ZWQuc2NoZWR1bGVfc3BlYyA9PSB7ImV4cHJlc3Npb24iOiAiKiAqICogKiAqIn0KKworCitAcHl0ZXN0Lm1hcmsucGFyYW1ldHJpemUoImFmdGVyLCBleHBlY3RlZCIsIFsKKyAgICAoIjIwMjYtMDMtMjlUMDA6NTU6MDArMDA6MDAiLCAiMjAyNi0wMy0yOVQwMTozMDowMCswMDowMCIpLAorICAgICgiMjAyNi0wMy0yOVQwMTowMDowMCswMDowMCIsICIyMDI2LTAzLTI5VDAxOjMwOjAwKzAwOjAwIiksCisgICAgKCIyMDI2LTAzLTI5VDAxOjI5OjAwKzAwOjAwIiwgIjIwMjYtMDMtMjlUMDE6MzA6MDArMDA6MDAiKSwKKyAgICAoIjIwMjYtMDMtMjlUMDE6MzA6MDArMDA6MDAiLCAiMjAyNi0wMy0zMFQwMDozMDowMCswMDowMCIpLAorICAgICgiMjAyNi0wMy0zMFQwMTowMDowMCswMDowMCIsICIyMDI2LTAzLTMxVDAwOjMwOjAwKzAwOjAwIiksCitdLCBpZHM9WyJiZWZvcmUtdHJhbnNpdGlvbiIsICJ0cmFuc2l0aW9uLWNvbXBsZXRlIiwgImJlZm9yZS1jYXJyaWVkLXRpbWUiLCAic3RyaWN0LWFmdGVyLWNhcnJpZWQtdGltZSIsICJvcmRpbmFyeS1kYXkiXSkKK2FzeW5jIGRlZiB0ZXN0X3Jldmlld19nYXBfY3JlYXRpb25fa2VlcHNfZG9jdW1lbnRlZF9zaGlmdGVkX29jY3VycmVuY2Uoc2Vzc2lvbnMsIG93bmVyLCBhZ2VudCwgY2xvY2ssIGFmdGVyLCBleHBlY3RlZCk6CisgICAgZnJvbSB6b25laW5mbyBpbXBvcnQgWm9uZUluZm8KKyAgICBjbG9jay5ub3cgPSBkYXRldGltZS5mcm9taXNvZm9ybWF0KGFmdGVyKQorICAgIHJvdXRpbmUgPSBhd2FpdCBtYWtlX3JvdXRpbmUoc2Vzc2lvbnMsIG93bmVyLCBhZ2VudCwgY2xvY2ssIHNjaGVkdWxlX2tpbmQ9IndlZWtkYXlzIiwgc2NoZWR1bGVfc3BlYz17ImRheXMiOiBsaXN0KHJhbmdlKDcpKSwgInRpbWUiOiAiMDI6MzAifSwgdGltZXpvbmU9IkV1cm9wZS9CZXJsaW4iKQorICAgIHJlZnJlc2hlZCA9IGF3YWl0IHJlbG9hZChzZXNzaW9ucywgUm91dGluZSwgcm91dGluZS5pZCkKKyAgICBleHBlY3RlZF9hdCA9IGRhdGV0aW1lLmZyb21pc29mb3JtYXQoZXhwZWN0ZWQpCisgICAgaWYgZXhwZWN0ZWRfYXQuZGF0ZSgpLmlzb2Zvcm1hdCgpID09ICIyMDI2LTAzLTI5IjoKKyAgICAgICAgYXNzZXJ0IGV4cGVjdGVkX2F0LmFzdGltZXpvbmUoWm9uZUluZm8oIkV1cm9wZS9CZXJsaW4iKSkuc3RyZnRpbWUoIiVIOiVNIikgPT0gIjAzOjMwIgorICAgIGFzc2VydCByZWZyZXNoZWQubmV4dF9ydW5fYXQgPT0gZXhwZWN0ZWRfYXQK'')
+
+        assert hashlib.sha256(p).hexdigest()==''582759eea8bb86e0da77d906406f307bd3b4d93a65b2fc77fca2664d4f3cd31d''
+
+        subprocess.run([''git'',''apply'',''-''],input=p,check=True)
+
+        pathlib.Path(''/tmp/dst-expected.patch'').write_bytes(p)
+
+        '
+    - name: candidate source guard before
+      shell: python
+      env:
+        POINT: before
+      run: 'import subprocess,pathlib,hashlib,json,os
+
+        a=subprocess.check_output([''git'',''diff'',''--full-index'',''--binary'',''HEAD''])
+
+        assert a==pathlib.Path(''/tmp/dst-expected.patch'').read_bytes()
+
+        assert hashlib.sha256(a).hexdigest()==''582759eea8bb86e0da77d906406f307bd3b4d93a65b2fc77fca2664d4f3cd31d''
+
+        pathlib.Path(os.environ[''RUNNER_TEMP''], ''source-''+''candidate''+''-''+os.environ[''POINT'']+''.json'').write_text(json.dumps({''head'':subprocess.check_output([''git'',''rev-parse'',''HEAD''],text=True).strip(),''patch_sha256'':hashlib.sha256(a).hexdigest()}))
+
+        '
+    - name: candidate actual calendar regressions and controls
+      id: candidate_calendar
+      continue-on-error: false
+      working-directory: backend
+      run: PYTHONPATH="$RUNNER_TEMP/proof-observer:$PWD" PROOF_ARTIFACT_DIR="$RUNNER_TEMP" env -u RUNNER_TEMP uv run --no-sync pytest -p observe_sqlite -q tests/services/test_routine_schedule.py
+        --junitxml="$RUNNER_TEMP/candidate-calendar.xml"
+    - name: candidate actual sqlite regressions and controls
+      id: candidate_sqlite
+      continue-on-error: false
+      working-directory: backend
+      run: PYTHONPATH="$RUNNER_TEMP/proof-observer:$PWD" PROOF_ARTIFACT_DIR="$RUNNER_TEMP" env -u RUNNER_TEMP uv run --no-sync pytest -p observe_sqlite -q tests/services/test_routine_service.py
+        -k test_review_gap_creation_keeps_documented_shifted_occurrence --junitxml="$RUNNER_TEMP/candidate-sqlite.xml"
+    - name: Exact candidate complete case identity and result oracle
+      shell: python
+      run: 'import pathlib,os,xml.etree.ElementTree as E,json
+
+        p=pathlib.Path(os.environ[''RUNNER_TEMP'']);r={}
+
+        root=E.parse(p/''candidate-calendar.xml'').getroot();cs=list(root.iter(''testcase''));assert not list(root.iter(''skipped'')) and not list(root.iter(''error''));r[''calendar'']={c.attrib[''name'']:c.find(''failure'')
+        is not None for c in cs}
+
+        root=E.parse(p/''candidate-sqlite.xml'').getroot();cs=list(root.iter(''testcase''));assert not list(root.iter(''skipped'')) and not list(root.iter(''error''));r[''sqlite'']={c.attrib[''name'']:c.find(''failure'')
+        is not None for c in cs}
+
+        assert {''test_next_after_retains_carried_gap_occurrences[''+i+'']'' for i in [''lord-howe-transition'', ''lord-howe-before-carried'', ''lord-howe-strict'',
+        ''apia-skipped-friday'', ''apia-strict'', ''nonselected-monday'', ''selected-sunday'', ''multi-hour-cron'', ''dense-cron'']} <= set(r[''calendar''])
+
+        assert set(r[''sqlite''])=={''test_review_gap_creation_keeps_documented_shifted_occurrence[''+i+'']'' for i in [''before-transition'',''transition-complete'',''before-carried-time'',''strict-after-carried-time'',''ordinary-day'']}
+
+        assert not any(r[''calendar''].values()) and not any(r[''sqlite''].values())
+
+        print(json.dumps(r,indent=2))
+
+        '
+    - name: candidate bounded dense cost observation
+      working-directory: backend
+      env:
+        CANDIDATE_PHASE: candidate
+      run: "uv run --no-sync python - <<'MEASURE'\n\"\"\"Observed CPU time and exact real-trigger calls, separate from functional gates.\"\"\"\nimport datetime\n\
+        import json\nimport os\nimport pathlib\nimport statistics\nimport time\nfrom app.services import routine_schedule as s\n\noriginal = s._crontab_trigger\n\
+        counter = [0]\nclass CountedTrigger:\n    def __init__(self, trigger):\n        self.trigger = trigger\n    def get_next_fire_time(self, *args):\n       \
+        \ counter[0] += 1\n        return self.trigger.get_next_fire_time(*args)\ndef counted(*args):\n    return CountedTrigger(original(*args))\ns._crontab_trigger\
+        \ = counted\nrows = []\nfor label, zone, expression, after in [\n    (\"ordinary-dense\", \"UTC\", \"* * * * *\", \"2026-10-20T12:00:20+00:00\"),\n    (\"\
+        berlin-dense-gap\", \"Europe/Berlin\", \"* * * * *\", \"2026-03-29T01:05:00+00:00\"),\n    (\"lord-howe-half-hour\", \"Australia/Lord_Howe\", \"15 2 * * *\"\
+        , \"2026-10-03T15:30:00+00:00\"),\n    (\"apia-expired-dense-window\", \"Pacific/Apia\", \"* * * * *\", \"2011-12-31T22:00:00+00:00\"),\n]:\n    times, calls,\
+        \ results = [], [], []\n    for _ in range(10):\n        counter[0] = 0\n        start = time.perf_counter()\n        result = s.next_after(\"cron\", {\"\
+        expression\": expression}, zone, datetime.datetime.fromisoformat(after))\n        times.append((time.perf_counter() - start) * 1000)\n        calls.append(counter[0])\n\
+        \        results.append(result.isoformat() if result else None)\n    assert len(set(results)) == 1\n    assert max(calls) <= 48 * 60 + 3, (label, calls)\n\
+        \    rows.append({\"case\": label, \"median_ms\": statistics.median(times), \"max_ms\": max(times), \"real_trigger_calls\": calls, \"next\": results[0]})\n\
+        pathlib.Path(os.environ[\"RUNNER_TEMP\"], \"cost-\" + os.environ[\"CANDIDATE_PHASE\"] + \".json\").write_text(json.dumps(rows, indent=2))\nprint(json.dumps(rows,\
+        \ indent=2))\nMEASURE\n"
+    - name: candidate source guard after
+      if: always()
+      shell: python
+      env:
+        POINT: after
+      run: 'import subprocess,pathlib,hashlib,json,os
+
+        a=subprocess.check_output([''git'',''diff'',''--full-index'',''--binary'',''HEAD''])
+
+        assert a==pathlib.Path(''/tmp/dst-expected.patch'').read_bytes()
+
+        assert hashlib.sha256(a).hexdigest()==''582759eea8bb86e0da77d906406f307bd3b4d93a65b2fc77fca2664d4f3cd31d''
+
+        pathlib.Path(os.environ[''RUNNER_TEMP''], ''source-''+''candidate''+''-''+os.environ[''POINT'']+''.json'').write_text(json.dumps({''head'':subprocess.check_output([''git'',''rev-parse'',''HEAD''],text=True).strip(),''patch_sha256'':hashlib.sha256(a).hexdigest()}))
+
+        '
+    - name: Preserve actual SQLite semantic receipts candidate
+      shell: python
+      run: 'import pathlib,os
+
+        p=pathlib.Path(os.environ[''RUNNER_TEMP'']);[(f.rename(p/(''candidate-''+f.name))) for f in p.glob(''routine-gap-*.json'')]'
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: open-dots-gap-candidate-${{ matrix.dataset }}-${{ github.run_id }}
+        path: '${{ runner.temp }}/*.xml
+
+          ${{ runner.temp }}/source-*.json
+
+          ${{ runner.temp }}/cost-*.json
+
+          ${{ runner.temp }}/timezone-window-preconditions.json
+
+          ${{ runner.temp }}/*-routine-gap-*.json'
+        if-no-files-found: error
