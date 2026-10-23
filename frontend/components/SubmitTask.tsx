@@ -5,6 +5,7 @@ import { api, ApiError, PermissionAsk, Schedule, Task } from "@/lib/api";
 import { Button, Card, ErrorText } from "./Card";
 
 const POLL_INTERVAL_MS = 3000;
+const HISTORY_REFRESH_INTERVAL_MS = 30_000;
 const ACTIVE_STATUSES: Task["status"][] = [
   "queued",
   "starting",
@@ -60,21 +61,32 @@ function describeSchedule(schedule: Schedule): string {
 function statusColor(status: Task["status"]) {
   switch (status) {
     case "succeeded":
-      return "text-emerald-600 dark:text-emerald-400";
+      return "text-success";
     case "failed":
-      return "text-red-600 dark:text-red-400";
+      return "text-danger";
     default:
-      return "text-amber-600 dark:text-amber-400";
+      return "text-warning";
   }
 }
 
 export function SubmitTask({
   userId,
   boxId,
+  step = 4,
+  blockedReason = null,
+  showComposer = true,
 }: {
   userId: string;
   boxId: string | null;
+  step?: number;
+  // false hides the new-task box and schedule option entirely (Boat is off, so
+  // they could never work); true shows them, disabled until Claude is connected.
+  showComposer?: boolean;
+  // Shown instead of the composer's usual hint when submitting is not possible.
+  blockedReason?: string | null;
 }) {
+  // History is always readable; only sending needs a sandbox signed in to Claude.
+  const canSubmit = Boolean(boxId);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [composer, setComposer] = useState("");
@@ -93,11 +105,14 @@ export function SubmitTask({
   const [replyBusy, setReplyBusy] = useState<Record<number, boolean>>({});
   const [replyErrors, setReplyErrors] = useState<Record<number, string | null>>({});
   const pollers = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
+  const knownTaskIds = useRef(new Set<number>());
+  const listVersion = useRef(0);
 
   const [pendingAsks, setPendingAsks] = useState<Record<number, PermissionAsk>>({});
   const [askBusy, setAskBusy] = useState<Record<number, boolean>>({});
 
   const upsertTask = (task: Task) => {
+    knownTaskIds.current.add(task.id);
     setTasks((prev) => {
       const next = prev.filter((t) => t.id !== task.id);
       next.unshift(task);
@@ -127,7 +142,9 @@ export function SubmitTask({
   const fetchPendingAsk = async (taskId: number) => {
     try {
       const ask = await api.getPendingAsk(taskId);
-      if (ask) setPendingAsks((prev) => ({ ...prev, [taskId]: ask }));
+      if (ask && pollers.current.has(taskId)) {
+        setPendingAsks((prev) => ({ ...prev, [taskId]: ask }));
+      }
     } catch {
       // transient — the next poll tick will retry
     }
@@ -135,9 +152,13 @@ export function SubmitTask({
 
   const startPolling = (taskId: number) => {
     if (pollers.current.has(taskId)) return;
+    let pending = false;
     const handle = setInterval(async () => {
+      if (pending) return;
+      pending = true;
       try {
         const updated = await api.getTask(taskId);
+        if (pollers.current.get(taskId) !== handle) return;
         upsertTask(updated);
         if (updated.status === "waiting_approval") {
           fetchPendingAsk(taskId);
@@ -149,34 +170,70 @@ export function SubmitTask({
         }
       } catch {
         // transient — keep polling
+      } finally {
+        pending = false;
       }
     }, POLL_INTERVAL_MS);
     pollers.current.set(taskId, handle);
   };
 
   useEffect(() => {
-    (async () => {
+    let cancelled = false;
+    let refreshing = false;
+    let replaceHistory = true;
+    knownTaskIds.current.clear();
+
+    const refresh = async () => {
+      if (cancelled || refreshing || document.visibilityState !== "visible") return;
+      refreshing = true;
+      const version = listVersion.current;
       try {
-        const history = await api.listTasks(userId);
-        setTasks(history);
-        history
-          .filter((t) => ACTIVE_STATUSES.includes(t.status))
-          .forEach((t) => {
-            startPolling(t.id);
-            if (t.status === "waiting_approval") fetchPendingAsk(t.id);
-          });
-      } catch {
-        // non-fatal — history is a nice-to-have
+        try {
+          const history = await api.listTasks(userId);
+          if (cancelled) return;
+          if (version === listVersion.current) {
+            if (replaceHistory) {
+              const retainedIds = new Set(knownTaskIds.current);
+              setTasks((prev) => prev.filter((task) => retainedIds.has(task.id)));
+              replaceHistory = false;
+            }
+            // Known tasks are updated by their task poller or local mutation;
+            // an older history snapshot must not replace those results.
+            history.slice().reverse().forEach((task) => {
+              if (knownTaskIds.current.has(task.id)) return;
+              upsertTask(task);
+              if (ACTIVE_STATUSES.includes(task.status)) {
+                startPolling(task.id);
+                if (task.status === "waiting_approval") fetchPendingAsk(task.id);
+              }
+            });
+          }
+        } catch {
+          // transient — retry the history on the next refresh
+        }
+        if (cancelled) return;
+        try {
+          const updated = await api.listSchedules(userId);
+          if (!cancelled && version === listVersion.current) setSchedules(updated);
+        } catch {
+          // transient — retain the schedule list and retry
+        }
+      } finally {
+        refreshing = false;
       }
-      try {
-        setSchedules(await api.listSchedules(userId));
-      } catch {
-        // non-fatal — schedule list is a nice-to-have
-      }
-    })();
+    };
+    const refreshVisible = () => {
+      void refresh();
+    };
+    void refresh();
+    const handle = setInterval(refreshVisible, HISTORY_REFRESH_INTERVAL_MS);
+    document.addEventListener("visibilitychange", refreshVisible);
 
     return () => {
-      pollers.current.forEach((handle) => clearInterval(handle));
+      cancelled = true;
+      clearInterval(handle);
+      document.removeEventListener("visibilitychange", refreshVisible);
+      pollers.current.forEach((poller) => clearInterval(poller));
       pollers.current.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -185,6 +242,7 @@ export function SubmitTask({
   const submitNew = async () => {
     if (!boxId || !composer.trim()) return;
     setComposerError(null);
+    listVersion.current += 1;
     setComposerBusy(true);
     try {
       if (scheduleEnabled) {
@@ -213,11 +271,13 @@ export function SubmitTask({
           : `Could not ${scheduleEnabled ? "create schedule" : "submit task"}.`
       );
     } finally {
+      listVersion.current += 1;
       setComposerBusy(false);
     }
   };
 
   const toggleSchedule = async (schedule: Schedule) => {
+    listVersion.current += 1;
     setScheduleBusy((prev) => ({ ...prev, [schedule.id]: true }));
     try {
       const updated = schedule.is_active
@@ -227,17 +287,21 @@ export function SubmitTask({
     } catch {
       // transient — leave state as-is, user can retry
     } finally {
+      listVersion.current += 1;
       setScheduleBusy((prev) => ({ ...prev, [schedule.id]: false }));
     }
   };
 
   const removeSchedule = async (schedule: Schedule) => {
+    listVersion.current += 1;
     setScheduleBusy((prev) => ({ ...prev, [schedule.id]: true }));
     try {
       await api.deleteSchedule(userId, schedule.id);
       setSchedules((prev) => prev.filter((s) => s.id !== schedule.id));
     } catch {
       setScheduleBusy((prev) => ({ ...prev, [schedule.id]: false }));
+    } finally {
+      listVersion.current += 1;
     }
   };
 
@@ -245,6 +309,7 @@ export function SubmitTask({
     const text = (replyDrafts[parent.id] ?? "").trim();
     if (!boxId || !text) return;
     setReplyErrors((prev) => ({ ...prev, [parent.id]: null }));
+    listVersion.current += 1;
     setReplyBusy((prev) => ({ ...prev, [parent.id]: true }));
     try {
       const task = await api.submitTask(userId, boxId, text, parent.id);
@@ -258,6 +323,7 @@ export function SubmitTask({
         [parent.id]: err instanceof ApiError ? err.message : "Could not send reply.",
       }));
     } finally {
+      listVersion.current += 1;
       setReplyBusy((prev) => ({ ...prev, [parent.id]: false }));
     }
   };
@@ -280,30 +346,42 @@ export function SubmitTask({
   };
 
   return (
-    <Card step={4} title="Submit a task" disabled={!boxId}>
+    <Card step={step} title={canSubmit ? "Submit a task" : "Task history"}>
       <div className="space-y-3">
+        {!canSubmit && (
+          <p className="text-sm text-muted">
+            {blockedReason ?? "Connect Claude above to submit new tasks."} Your earlier tasks
+            stay readable below.
+          </p>
+        )}
+        {showComposer && (
+        <>
         <textarea
           value={composer}
           onChange={(e) => setComposer(e.target.value)}
           placeholder='e.g. "create a webpage that says hello"'
+          aria-label="New task"
           rows={3}
-          className="w-full rounded-md border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+          disabled={!canSubmit}
+          className="w-full rounded-md border border-line px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
         />
-        <label className="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+        <label className="flex items-center gap-2 text-sm text-ink">
           <input
             type="checkbox"
             checked={scheduleEnabled}
+            disabled={!canSubmit}
             onChange={(e) => setScheduleEnabled(e.target.checked)}
           />
           Repeat this on a schedule
         </label>
 
         {scheduleEnabled && (
-          <div className="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
+          <div className="flex flex-wrap items-center gap-2 rounded-md border border-line p-3">
             <select
+              aria-label="How often"
               value={frequency}
               onChange={(e) => setFrequency(e.target.value as Frequency)}
-              className="rounded-md border border-zinc-300 px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+              className="rounded-md border border-line px-2 py-1.5 text-sm"
             >
               {FREQUENCIES.map((f) => (
                 <option key={f} value={f}>
@@ -314,9 +392,10 @@ export function SubmitTask({
 
             {frequency === "weekly" && (
               <select
+                aria-label="Day of the week"
                 value={scheduleWeekday}
                 onChange={(e) => setScheduleWeekday(Number(e.target.value))}
-                className="rounded-md border border-zinc-300 px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+                className="rounded-md border border-line px-2 py-1.5 text-sm"
               >
                 {WEEKDAYS.map((d) => (
                   <option key={d.value} value={d.value}>
@@ -329,17 +408,18 @@ export function SubmitTask({
             {frequency !== "hourly" && (
               <input
                 type="time"
+                aria-label={`Time (${timezone})`}
                 value={scheduleTime}
                 onChange={(e) => setScheduleTime(e.target.value)}
-                className="rounded-md border border-zinc-300 px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+                className="rounded-md border border-line px-2 py-1.5 text-sm"
               />
             )}
 
-            <span className="text-xs text-zinc-500">{timezone}</span>
+            <span className="text-xs text-muted">{timezone}</span>
           </div>
         )}
 
-        <Button onClick={submitNew} disabled={composerBusy || !composer.trim()}>
+        <Button onClick={submitNew} disabled={!canSubmit || composerBusy || !composer.trim()}>
           {composerBusy
             ? scheduleEnabled
               ? "Creating…"
@@ -349,30 +429,32 @@ export function SubmitTask({
               : "Submit task"}
         </Button>
         <ErrorText message={composerError} />
+        </>
+        )}
 
         {schedules.length > 0 && (
           <ul className="space-y-2 pt-2">
             {schedules.map((schedule) => (
               <li
                 key={schedule.id}
-                className="rounded-md border border-zinc-200 p-3 text-sm dark:border-zinc-800"
+                className="rounded-md border border-line p-3 text-sm"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="truncate text-zinc-700 dark:text-zinc-300">
+                    <p className="truncate text-ink">
                       {schedule.prompt_text}
                     </p>
-                    <p className="text-xs text-zinc-500">
+                    <p className="text-xs text-muted">
                       {schedule.cron_expression} ({schedule.timezone}) ·{" "}
                       {describeSchedule(schedule)}
                     </p>
                     {schedule.paused_reason && (
-                      <p className="text-xs text-red-600 dark:text-red-400">
+                      <p className="text-xs text-danger">
                         Paused: {schedule.paused_reason}
                       </p>
                     )}
                     {!schedule.paused_reason && schedule.last_error && (
-                      <p className="text-xs text-red-600 dark:text-red-400">
+                      <p className="text-xs text-danger">
                         {schedule.last_error}
                       </p>
                     )}
@@ -381,14 +463,14 @@ export function SubmitTask({
                     <button
                       onClick={() => toggleSchedule(schedule)}
                       disabled={scheduleBusy[schedule.id]}
-                      className="text-xs text-zinc-500 underline disabled:opacity-50"
+                      className="text-xs text-muted underline disabled:opacity-50"
                     >
                       {schedule.is_active ? "Pause" : "Resume"}
                     </button>
                     <button
                       onClick={() => removeSchedule(schedule)}
                       disabled={scheduleBusy[schedule.id]}
-                      className="text-xs text-red-600 underline disabled:opacity-50 dark:text-red-400"
+                      className="text-xs text-danger underline disabled:opacity-50"
                     >
                       Delete
                     </button>
@@ -409,13 +491,13 @@ export function SubmitTask({
               return (
                 <li
                   key={task.id}
-                  className="rounded-md border border-zinc-200 dark:border-zinc-800"
+                  className="rounded-md border border-line"
                 >
                   <button
                     onClick={() => setExpandedId(expanded ? null : task.id)}
                     className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm"
                   >
-                    <span className="truncate text-zinc-700 dark:text-zinc-300">
+                    <span className="truncate text-ink">
                       #{task.id} {task.prompt_text}
                     </span>
                     <span className={`shrink-0 text-xs ${statusColor(task.status)}`}>
@@ -424,20 +506,20 @@ export function SubmitTask({
                   </button>
 
                   {expanded && (
-                    <div className="border-t border-zinc-200 p-3 text-sm dark:border-zinc-800">
+                    <div className="border-t border-line p-3 text-sm">
                       {task.result && (
-                        <pre className="whitespace-pre-wrap break-words text-xs text-zinc-700 dark:text-zinc-300">
+                        <pre className="whitespace-pre-wrap break-words text-xs text-ink">
                           {task.result}
                         </pre>
                       )}
                       {task.error && (
-                        <pre className="whitespace-pre-wrap break-words text-xs text-red-600 dark:text-red-400">
+                        <pre className="whitespace-pre-wrap break-words text-xs text-danger">
                           {task.error}
                         </pre>
                       )}
                       {task.status === "waiting_approval" && (
-                        <div className="space-y-2 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950">
-                          <p className="text-xs text-amber-800 dark:text-amber-300">
+                        <div className="space-y-2 rounded-md border border-warning/50 bg-warning/10 p-3">
+                          <p className="text-xs text-ink">
                             {ask
                               ? `Wants to use: ${ask.tool ?? ask.connector ?? ask.bucket} (bucket: ${ask.bucket}). Allow it?`
                               : "Waiting on a permission decision…"}
@@ -459,7 +541,7 @@ export function SubmitTask({
                               <button
                                 onClick={() => answerAsk(task, "deny", false)}
                                 disabled={askBusy[ask.id]}
-                                className="rounded-md border border-red-300 px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-800 dark:text-red-400 dark:hover:bg-red-950"
+                                className="rounded-md border border-danger/50 px-4 py-2 text-sm font-medium text-danger transition-colors hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-50"
                               >
                                 Deny
                               </button>
@@ -469,10 +551,10 @@ export function SubmitTask({
                       )}
 
                       {active && task.status !== "waiting_approval" && (
-                        <p className="text-xs text-zinc-500">Working…</p>
+                        <p className="text-xs text-muted">Working…</p>
                       )}
 
-                      {!active && (
+                      {!active && showComposer && (
                         <div className="mt-3 space-y-2">
                           <textarea
                             value={replyDrafts[task.id] ?? ""}
@@ -481,12 +563,15 @@ export function SubmitTask({
                             }
                             placeholder="Reply in this conversation…"
                             rows={2}
-                            className="w-full rounded-md border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+                            disabled={!canSubmit}
+                            className="w-full rounded-md border border-line px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
                           />
                           <Button
                             onClick={() => submitReply(task)}
                             disabled={
-                              replyBusy[task.id] || !(replyDrafts[task.id] ?? "").trim()
+                              !canSubmit ||
+                              replyBusy[task.id] ||
+                              !(replyDrafts[task.id] ?? "").trim()
                             }
                           >
                             {replyBusy[task.id] ? "Sending…" : "Reply"}

@@ -1,11 +1,14 @@
-# Vadoo Autonomous Agent — Backend
+# Open Duet — Backend
 
-FastAPI service + Telegram bot that run coding agent tasks (e.g. Claude Code)
-inside disposable sandboxes provided by [Boat](https://docs.boat.dev).
+FastAPI service behind Open Duet's AI coworkers: named agents, durable
+conversations on several engines, routines, approvals, memory and agent
+computers, plus an optional Telegram bot and the original task flow in
+disposable sandboxes provided by [Boat](https://docs.boat.dev).
 
-For prerequisites, `.env` setup, and how to run the whole stack (this API,
-the Telegram bot, and the [web UI](../frontend)) with one command, see the
-[repo root README](../README.md). This file covers backend-specific details.
+For prerequisites, local development setup, and how to run the whole stack
+(this API, the Telegram bot, and the [web UI](../frontend)), see
+[docs/SETUP.md](../docs/SETUP.md). Backend environment variables are listed in
+[`.env.example`](.env.example). This file covers backend-specific details.
 
 ## Layout
 
@@ -32,6 +35,8 @@ the Telegram bot, and the [web UI](../frontend)) with one command, see the
   changes that touch `app/db/models/`.
 
 ## Running just the backend
+
+To run the whole app on a server (pages and API in one process, with its own database commands), see [docs/SELF-HOSTING.md](../docs/SELF-HOSTING.md); the steps below are for developing the backend.
 
 ```bash
 docker compose up -d                # Postgres

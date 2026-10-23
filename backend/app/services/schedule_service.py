@@ -1,6 +1,8 @@
+import re
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import exists, select, update
 from sqlalchemy.exc import IntegrityError
@@ -10,6 +12,7 @@ from app.core.logging import get_logger
 from app.db.models.schedule import Schedule
 from app.db.models.task import Tasks
 from app.db.session import AsyncSessionLocal
+from app.db.transactions import begin_write
 from app.services import notification_service, task_execution_service
 from app.services.task_execution_service import (
     ACTIVE_STATUSES,
@@ -52,13 +55,46 @@ class ScheduleInactiveError(Exception):
     pass
 
 
+def _crontab_trigger(expression: str, timezone: ZoneInfo) -> CronTrigger | OrTrigger:
+    # Validate with APScheduler first, retaining the existing accepted syntax.
+    CronTrigger.from_crontab(expression, timezone=timezone)
+    minute, hour, day, month, weekday = expression.split()
+
+    # Standard crontab and our UI/Telegram presets use Sunday=0, whereas
+    # APScheduler 3 uses Monday=0. Expand numeric ranges before translating:
+    # rotating range endpoints would turn 0-6 into the invalid range sun-sat.
+    names = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+    translated = []
+    for part in weekday.split(","):
+        match = re.fullmatch(r"(\*|\d+)(?:-(\d+))?(?:/(\d+))?", part)
+        if part == "*" or match is None:
+            translated.append(part)
+            continue
+        first, last, step = match.groups()
+        start = 0 if first == "*" else int(first)
+        end = int(last) if last is not None else (6 if step or first == "*" else start)
+        translated.extend(names[value] for value in range(start, end + 1, int(step or 1)))
+
+    weekday_expression = ",".join(translated)
+    if not day.startswith("*") and not weekday.startswith("*"):
+        # Crontab runs when either restricted day field matches. APScheduler
+        # intersects all fields, so keep these two alternatives separate.
+        return OrTrigger([
+            CronTrigger.from_crontab(f"{minute} {hour} {day} {month} *", timezone=timezone),
+            CronTrigger.from_crontab(f"{minute} {hour} * {month} {weekday_expression}", timezone=timezone),
+        ])
+    return CronTrigger.from_crontab(
+        f"{minute} {hour} {day} {month} {weekday_expression}", timezone=timezone
+    )
+
+
 def compute_next_run(cron_expression: str, timezone: str, after: datetime) -> datetime:
     try:
         tz = ZoneInfo(timezone)
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise InvalidScheduleError(f"Unknown timezone: {timezone}") from exc
     try:
-        trigger = CronTrigger.from_crontab(cron_expression, timezone=tz)
+        trigger = _crontab_trigger(cron_expression, tz)
     except ValueError as exc:
         raise InvalidScheduleError(
             f"Invalid cron expression {cron_expression!r}: {exc}"
@@ -130,6 +166,7 @@ async def list_schedules(db: AsyncSession, user_id: str) -> list[Schedule]:
 async def update_schedule(
     db: AsyncSession, schedule_id: int, user_id: str, changes: dict
 ) -> Schedule:
+    await begin_write(db)
     schedule = await get_schedule(db, schedule_id, user_id)
     changes = {
         k: v for k, v in changes.items() if k in UPDATABLE_FIELDS and v is not None
@@ -152,6 +189,7 @@ async def update_schedule(
 
 
 async def pause_schedule(db: AsyncSession, schedule_id: int, user_id: str) -> Schedule:
+    await begin_write(db)
     schedule = await get_schedule(db, schedule_id, user_id)
     schedule.is_active = False
     await db.commit()
@@ -160,6 +198,7 @@ async def pause_schedule(db: AsyncSession, schedule_id: int, user_id: str) -> Sc
 
 
 async def resume_schedule(db: AsyncSession, schedule_id: int, user_id: str) -> Schedule:
+    await begin_write(db)
     schedule = await get_schedule(db, schedule_id, user_id)
     # Computed from now so occurrences missed while paused don't fire.
     schedule.next_run_at = compute_next_run(
@@ -174,6 +213,7 @@ async def resume_schedule(db: AsyncSession, schedule_id: int, user_id: str) -> S
 
 
 async def run_schedule_now(db: AsyncSession, schedule_id: int, user_id: str) -> Schedule:
+    await begin_write(db)
     schedule = await get_schedule(db, schedule_id, user_id)
     if not schedule.is_active:
         raise ScheduleInactiveError(f"Schedule {schedule_id} is paused — resume it first")
@@ -184,6 +224,7 @@ async def run_schedule_now(db: AsyncSession, schedule_id: int, user_id: str) -> 
 
 
 async def delete_schedule(db: AsyncSession, schedule_id: int, user_id: str) -> None:
+    await begin_write(db)
     schedule = await get_schedule(db, schedule_id, user_id)
     schedule.is_active = False
     schedule.deleted_at = datetime.now(UTC)
@@ -265,6 +306,9 @@ async def poll_due_schedules() -> None:
     # can't consume an occurrence without leaving a task row for it; queued
     # tasks orphaned after this commit are recovered by sync_active_tasks.
     async with AsyncSessionLocal() as db:
+        # SQLite has no SKIP LOCKED: the whole claim runs as one write
+        # transaction, so a second poller waits, then finds nothing due.
+        await begin_write(db)
         result = await db.execute(
             select(Schedule)
             .where(
@@ -310,6 +354,7 @@ async def _pause(db: AsyncSession, schedule_id: int, reason: str) -> None:
 
 
 async def _report_task(db: AsyncSession, task: Tasks) -> None:
+    await begin_write(db)
     schedule = await db.get(Schedule, task.schedule_id)
     if schedule is None or schedule.deleted_at is not None:
         return
@@ -357,6 +402,9 @@ async def _report_task(db: AsyncSession, task: Tasks) -> None:
 
     chat_id = notification_service.telegram_chat_id(schedule.user_id)
     if chat_id is not None:
+        # Save the counters first: do not hold the write lock (SQLite) across
+        # the Telegram call.
+        await db.commit()
         await notification_service.send_telegram_message(chat_id, message)
 
 

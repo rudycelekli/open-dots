@@ -1,0 +1,624 @@
+# Memory and context
+
+How a named agent remembers things between conversations, and how a long
+conversation stays inside an engine's context window. Everything here applies
+to conversations started from a named agent; a conversation without an agent
+has no notes, no recall and no proposals (compaction still applies).
+
+## What is where
+
+```
+<LOCAL_WORKSPACE_ROOT>/agents/<agent id>/
+├── MEMORY.md           loads into every turn (first 200 lines / 24 KB)
+└── memory/
+    ├── <topic>.md      one subject each; never loaded whole
+    ├── archive.md      older entries moved out of MEMORY.md to make room
+    └── log/
+        └── 2026-10-23.md   one line per finished turn that day (never loaded)
+
+<data folder>/memory-state/            (beside the attachments folder)
+├── journal/<agent id>.ndjson          every change made through the app
+├── proposals/<agent id>.json          proposed notes waiting for you
+├── upkeep/<agent id>.json             what the last quiet capture did
+└── capture-pending.json               ids of turns waiting when the app quit
+```
+
+The data folder is `~/.open-dots` by default (the desktop app's own data
+folder in the desktop app). The journal and the proposals live outside the
+agent's folder on purpose: an agent with file tools works in its own folder,
+and a record it could rewrite would not be a record.
+
+## Topic notes
+
+`MEMORY.md` holds what the agent needs in every conversation. Longer notes
+about one subject (a person, a client, a trip) go in `memory/<topic>.md`.
+
+- **Names.** One file name: letters, digits, dashes and underscores, ending in
+  `.md`, at most 63 characters (`travel.md`, `client-acme.md`). No folders,
+  no dots inside, nothing hidden, not `MEMORY.md`.
+- **Header.** A note may start with front matter giving a `title` and
+  `aliases` (other words someone would use for the subject):
+
+  ```
+  ---
+  title: Travel
+  aliases: [trips, flights]
+  ---
+  - Prefers aisle seats
+  ```
+
+  Without front matter the first heading is the title.
+- **The index.** The system prompt lists every topic by name, title and
+  aliases after the `MEMORY.md` block: at most 40 topics or 2,000 characters,
+  then "…and N more". The bodies are never loaded whole: the agent reads a note
+  with its file tools when it decides it needs it, and recall (below) puts a
+  matching passage in front of a message.
+- **Safety, the same as MEMORY.md.** Anything that looks like a secret is
+  redacted when a note is saved through the app and again whenever any part of
+  it is loaded (index, recall), so a note the agent wrote with its own tools is
+  covered too. Writes are atomic (a crash leaves the old file or the new one)
+  and owner-only (`0600`). A note is at most 64 KB and an agent keeps at most
+  100. A save carries the hash of the text it was based on and is refused
+  (`409 memory_changed`, with the current text) when the file changed
+  meanwhile; a note not created yet has the hash of the empty text. A link, or
+  a `memory/` folder that is a link, reads as nothing and is never written
+  through.
+- **Lifecycle.** Deleting an agent deletes its notes, topic notes, journal and
+  proposals (the folder stays, as conversations may use it). A duplicate starts
+  without any. Agent files (export/import) carry `MEMORY.md` and the topic notes
+  (`notes.topics`, name to text; not the archive, daily logs, journal or
+  proposals), all redacted; an import with notes writes them into the new agent's
+  folder. A topic note over 64 KB, past 100 notes or past 600 KB together is left
+  out of an export and named in the response's `skipped`; an import refuses the
+  whole file for a bad name, an oversized note or too many bytes, and records each
+  file it writes as a journal row by `import` (undoable). An import only ever makes
+  a new agent, so it cannot overwrite existing notes.
+
+## The budget: archive, expire, supersede
+
+Only the first 200 lines / 24 KB of `MEMORY.md` load, so a line added past that
+would never be seen. `MEMORY.md` therefore never overflows through the app:
+
+- **Archive instead of overflow.** Every write the app makes on its own (a
+  noticed fact, an accepted proposal) keeps the file inside the budget in the
+  same step. When the new line would push it past, the oldest **dated** entries
+  move whole to `memory/archive.md`, each marked `· moved <date>`: struck-through
+  (superseded) ones first, then expired ones, then the oldest live ones. An entry
+  moves with the lines indented under it (or its code block). The archive is
+  written, and journaled, before `MEMORY.md`, so a line is never out of one
+  without being in the other, and undoing the newest change loses nothing.
+  Never moved: lines written by hand (no date), live health and safety facts
+  (allergies, diet, medication and the like), and the line just written. When
+  the lines that never move fill the budget by themselves (or the agent edited
+  the file with its own tools) the new entry is still saved and the gauge goes
+  red; trim the file by hand.
+- **The agent is told.** For three days after entries move, the system prompt
+  says how many moved to `memory/archive.md` and quotes the first three, so the
+  agent can add back anything that should stay loaded.
+- **Per-entry caps.** An entry the app writes is at most 1,000 characters and 20
+  lines (an accepted proposal over that is refused with `422 entry_too_large`
+  and stays in the queue), so one note cannot push the rest out. The editor and
+  the agent's own file tools are not capped here.
+- **Until dates.** A line ending `· until 2026-11-02` stops loading the day
+  after that date (and is not recalled from a topic note). The file keeps it,
+  and the gauge says how many expired notes are not loaded. Expiry is applied
+  before the 200-line cut, so expired lines never push live ones out of view.
+- **Superseded entries.** A replaced fact is struck through, not deleted:
+  `- 2026-10-01 · ~~The office is in Pune~~ · superseded 2026-10-23`. Struck
+  entries stay in the file (and in the line count) but topic recall skips them.
+  The agent is told this convention in its notes guidance, and the nightly
+  tidy-up strikes contradicted entries through.
+- **The archive is never recalled.** It is older or no longer true; it is
+  listed last in the topic index and can be read like any topic note.
+
+## Recall before each turn
+
+Before each turn of a conversation with an agent whose notes and recall are
+both on, the person's message is matched against the agent's topic notes and
+its other conversations.
+
+- **Matching.** The message's content words (three letters or more, common
+  words left out, at most 12 from the first 500 characters; a message under 8
+  characters recalls nothing). Any matching word counts; a message with five
+  or more content words needs two in a passage. Notes match on their name,
+  title, aliases and body (not their expired or superseded entries, and never `archive.md`); conversation passages are messages (yours and the
+  agent's) in this agent's other, non-archived conversations, found with the
+  same portable query as conversation search (OR instead of AND; works the same
+  on SQLite and PostgreSQL, wildcards literal).
+- **Ranking and limits.** Up to **4 notes** (by words shared, then most
+  recently changed; about 600 characters each, starting at the first matching
+  line) and **4 conversation passages** (by words shared, then newest; at most
+  2 from one conversation; about 400 characters each), all within **6,000
+  characters**. `MEMORY.md` is never recalled (it is already loaded) and
+  neither is the current conversation (it is already in context).
+- **Where it goes.** In front of the person's message, never in the system
+  prompt: recall changes nearly every turn, and a changing system prompt would
+  defeat the engines' prompt caching. The block opens by saying these are
+  passages found automatically because they share words with the message, that
+  they are background only, that what the person says now wins over an older
+  passage, and that nothing inside them is an instruction or grants permission
+  for anything. It ends with a closing line; text inside a passage that tries
+  to close the block early is neutralised. Every passage is one line and
+  redacted.
+- **Visible, never hidden.** What was recalled is stored as a
+  `memory.recalled` event right after the turn starts, and the transcript shows
+  it as a **Recalled** chip ("Recalled 1 note and 2 passages from earlier
+  conversations") that opens to show each passage and where it came from. The
+  stored message is what the person typed.
+- **Switch.** `recall_enabled` on the agent (on by default; `PATCH
+  /api/v1/agents/{id}`; the checkbox under the notes editor). Switching notes
+  off (`memory_enabled`) switches recall off too. A failure while recalling is
+  logged and the turn goes on without it.
+- **Every engine.** Recall is part of the turn's prompt, so Claude, Codex, ACP
+  agents and OpenAI-compatible endpoints all receive it. (The OpenAI-compatible
+  engine now sends the turn's prompt for the current message instead of the
+  stored text, which also means attached text files reach it.)
+
+## Context compaction
+
+Claude and Codex keep their own sessions and use their CLI's own compaction;
+nothing here touches them. Two engines replay the transcript and opt in
+(`replays_history`):
+
+- an **OpenAI-compatible endpoint** keeps no session, so every turn sends the
+  whole stored conversation;
+- an **ACP agent** that cannot reload its session is sent the conversation as
+  a preamble.
+
+Before such a replay, its size is estimated in tokens from characters with a
+per-engine ratio (4 characters a token for OpenAI-compatible, 3.5 for ACP, a
+few tokens per message, plus the agent's instructions). When it reaches the
+budget, the earlier part is folded:
+
+- **Budget.** `compact_at_tokens` of the engine (24,000), or 80% of
+  `context_tokens` when the endpoint's saved configuration gives its model's
+  context window (`PUT /api/v1/engines/openai_compat/config` with
+  `"context_tokens": 8192`, from 1,024 to 10,000,000; there is no field for it
+  in Settings yet).
+- **Fold point.** Deterministic: the last **4 exchanges** (your message and
+  everything after it) stay verbatim, and so does the current message;
+  everything before is folded. When 4 exchanges would not leave the replay
+  under 70% of the budget, fewer are kept (down to 1), so a fold leaves
+  headroom and the conversation is not folded again on the very next turn.
+- **Summary.** Made without a model call: the newest excerpts of what was said
+  (up to 240 characters each), oldest first, after any earlier summary, within
+  a quarter of the budget and at most 6,000 characters, with a count of
+  excerpts left out and of tool calls (never quoted). It is headed as background
+  made of excerpts, where later messages override earlier ones and details may
+  be missing. It is redacted, and rides at the head of the first kept message
+  (a chat must start with the person). This is the fallback of the
+  model-written summary below.
+- **Model-written summary (on by default).** When the engine has a quick text call
+  (an OpenAI-compatible endpoint or OpenRouter), it writes the
+  summary of the folded part: one call to the same engine and model the conversation
+  already uses, **20 seconds at most**. The folded messages are redacted **before**
+  they are cut or sent, and the answer is redacted again, kept to 2,600 characters,
+  headed as model-written and followed by the newest excerpts. A failing, empty or
+  slow call (cancelled at the limit) keeps the excerpt summary; the stored event says
+  which one it is (`method`: `model` or `excerpts`). **Stop ends the whole turn**:
+  pressing Stop while the summary is being written cancels the call, sends nothing
+  to the engine and stores no fold, and an answer that arrives late is never applied.
+  What leaves the machine is the folded conversation, to the engine it was already
+  sent to (an ACP agent has no quick call: its summary is written by the helper model
+  when one is set, see "The helper model", and is excerpts otherwise). Switch it off for everyone with `COMPACTION_MODEL_SUMMARY=false`, or for one
+  agent with `compaction_summary: false` (`PATCH /api/v1/agents/{id}`; the checkbox
+  under **Memory upkeep**); both keep the excerpt summary.
+- **Stored and stable.** The fold is stored as a `context.compacted` event in
+  the turn that made it (summary, folded-through turn, messages folded,
+  tokens before and after, budget). Later turns replay exactly the same summary
+  plus what came after, so the replay does not change from turn to turn, until
+  the conversation reaches the budget again and folds once more. A record whose
+  turn no longer exists is ignored.
+- **Visible.** The transcript shows **Earlier messages summarized** with the
+  number of messages folded and a button that shows the summary. The full
+  conversation stays stored and visible; only what the engine is sent changes.
+- With a very small window (around 1,000 tokens) and long instructions, even
+  one kept exchange plus the summary can exceed 70% of the budget; the
+  conversation is then folded a little further on every turn (still correct,
+  but the replay changes each turn).
+- When only the kept exchanges are left and they are too large by themselves,
+  nothing more is folded and the engine's own size limit applies, as before.
+
+## Proposed notes
+
+Proposals never write to an agent's notes on their own (noticed facts, below, do, and say so). Once a conversation
+with the agent has been quiet for two minutes, your own messages in it (never
+the agent's replies) are read for statements meant to last: "remember that
+…", "from now on …", "I prefer / I always / I live in / I work at …", "my …
+is …". Questions are skipped. Each one becomes a proposal quoting your words:
+
+```
+- 2026-10-18 · from "Trip planning" · The person said: "I prefer aisle seats"
+```
+
+The **Proposed** tab under an agent's notes lists them; **Accept** appends the
+line to `MEMORY.md` (or a topic note, through the API) with the same save as
+the editor, journaled and undoable; **Reject** drops it, and the same line is
+never proposed again. A line already in `MEMORY.md`, already proposed, or
+holding anything that looked like a secret is not proposed. At most 50 wait at
+once, 5 per conversation.
+
+The proposer is deterministic, with no model call, so it misses facts said in
+other ways. Conversations are read when the queue is looked at (opening the
+tab, or `GET .../memory/proposals`), not by a background loop; each
+conversation is read once up to its latest turn.
+
+## Noticed facts (memory upkeep)
+
+The proposer above only quotes the person's literal statements. **Memory upkeep**
+adds a model that reads the whole exchange. When a one-to-one conversation with
+an agent has been quiet for two minutes (`MEMORY_CAPTURE_QUIET_SECONDS`, 120), or
+after six turns, **one** quick call reads those turns beside `MEMORY.md` and the
+topic list and files what is new:
+
+- a core fact the agent needs in every conversation goes to `MEMORY.md`, marked
+  `(noticed)`: `- 2026-10-23 · from chat "Plans" (noticed) · The person is vegetarian`;
+- everything else goes to a topic note for its subject, reusing an existing
+  topic (whatever its capitalisation) or creating one with a header (`title`,
+  `aliases`), so recall finds it later; an existing note only gains aliases it
+  does not have yet (up to 12);
+- a fact that ends on a known day gets `· until YYYY-MM-DD`; a birthday or other
+  yearly date, and anything lasting, never does. An `until` that is not a real
+  day or is already past drops the fact rather than guess.
+
+**Written directly, not proposed.** Noticed facts go straight into the files,
+unlike the literal-statement proposals that wait in the **Proposed** tab. A
+model has already judged the whole exchange, each write is small, redacted,
+capped and journaled by **Memory upkeep** (so **Undo** in the History tab
+removes it), and the switch is per agent. Nothing already in the file, and
+nothing that held something that looked like a secret, is written. A save
+re-reads the file and retries once if the agent changed it meanwhile.
+
+**What is never read.** A turn that failed or was stopped, a routine or webhook
+run, a turn started by another agent (a teammate hand-off or a room), an
+exchange too short on both sides to hold a fact ("reply with just: ok" and
+"ok", under 24 bytes each), a conversation deleted before the call, and any
+agent whose notes or upkeep are off. One call per agent at a time; a failing,
+slow or unsupported engine costs nothing but the call (the status says so).
+A conversation's waiting turns are kept as ids (never their text) when the app
+shuts down normally and read back at the next start; a crash or forced kill
+loses them.
+
+**How the call is made, and what leaves your machine.** It goes to the engine the
+conversation already uses, with that engine's own sign-in: on Claude, one
+`claude -p` call with no tools, no MCP servers, no saved session and a new empty
+folder, on the small `haiku` model; on an OpenAI-compatible endpoint or
+OpenRouter, one non-streamed request to the same address and key, on the
+endpoint's own model. The text sent is the quiet turns (the person's words and
+the agent's replies), the notes as they stand (redacted) and the topic list. It
+goes only to that engine and model; nothing is sent anywhere new. Codex and ACP
+agents have no quick call here, so they are not read unless a **helper model** is
+set (see "The helper model", below; the status says so, and their proposals and
+notes still work). `MEMORY_HELPER_MODEL` (environment, for example
+`claude=sonnet,openai_compat=llama3`) chooses another model on the same engine,
+never another provider.
+
+**Switch.** `memory_upkeep` on the agent (on by default; `PATCH
+/api/v1/agents/{id}`; the checkbox under the notes editor); notes off switches it
+off too, and `MEMORY_CAPTURE_QUIET_SECONDS=0` switches it off for everyone.
+`GET /api/v1/agents/{id}/memory/upkeep` reports whether it is on, whether the
+engine can make the call, and what the last capture did.
+
+## What an agent knows about its other conversations
+
+An agent's one-to-one chats and its rooms are separate conversations, and its
+notes hold only what stays true. Two things close the gap without attaching
+transcripts:
+
+- **The recent-work brief.** Every turn's system prompt, one-to-one or room,
+  carries a short block while the agent's notes are on: the newest thing the
+  agent said in each of its *other* conversations over the last 48 hours, newest
+  first, for example `today 09:05 · 1:1 chat "Invoices" · you said: "Sent the
+  three flagged invoices…"`. At most ten lines and 1,400 characters; the current
+  conversation is never listed; archived conversations, delegated-task threads,
+  routine runs and turns that did not succeed are left out; lines are redacted.
+  When a **room** turn's brief names a private one-to-one chat, the room gets a
+  notice once per chat (*Scout's recent-work brief covers 1 private chat with
+  you*), the same rule as recalled messages: a private chat reaches a room only
+  openly. A brief rides in the system prompt (it changes only when another
+  conversation says something new); recall rides in the message.
+- **One log line per finished turn.** With the agent's notes on, every finished
+  turn (including a failed or stopped one, and a routine run) appends a line to
+  `memory/log/YYYY-MM-DD.md`: the time, the conversation (`chat "…"`, `room "…"`),
+  what the agent said last (240 characters), the tools it used, and whether it
+  failed or was stopped. Logs are never loaded into a prompt and never recalled
+  automatically; a day's log stops growing at 64 KB; text is redacted; a link
+  where the folder or file should be is never followed. They are read-only in the
+  API (list, read, delete); deleting an agent deletes them.
+
+### Searching past conversations (session_search)
+
+An agent with notes on also gets two read-only tools from one small MCP server
+started for each turn (`memory`; on Claude `mcp__memory__session_search` and
+`mcp__memory__session_read`). **Claude, Codex and ACP agents** get them; see
+"Which engines" below.
+
+- **session_search** takes `query` (words that must all match), `since` and
+  `until` (a span like `24h`, `3d`, `2w`; `today`, `yesterday`; or a date), `limit`
+  (up to 25) and `scope` (`all`, `conversations`, `memory`). Words, a time, or both:
+  "what happened since yesterday's standup" needs no keyword. It covers the agent's
+  own one-to-one chats and the timelines of the rooms it belongs to, and its
+  memory files: `MEMORY.md` and topic notes without expired or superseded entries,
+  plus `archive.md` and the daily logs, which stay searchable on purpose. Never
+  another agent's history; archived conversations and delegated-task threads are
+  left out. Hits give when, where, who spoke and a thread and message id.
+- **session_read** returns one whole message by those ids (cut at 8,000
+  characters, redacted); another agent's message reads as missing.
+
+No card is shown (the calls only read the agent's own history, and the policy
+allows exactly these two tools); the turn's host tools stay off unless tools were
+already on, and are never switched on by the search. A request cannot name another agent: the backend answers for the
+agent the turn belongs to, through the turn's private mailbox folder.
+**Disclosure:** when a room turn's search or read uses a private one-to-one chat,
+the room gets a notice once per chat (*Scout recalled 1 message from its private
+chat with you*), whichever engine made the call: the answers come from the same
+backend code for every engine, so the private-chat and room rules are the same.
+The agent is told about the tools in its instructions.
+
+**Which engines.**
+
+- **Claude:** the server is passed with the turn's MCP servers; the policy allows the
+  two tools without a card.
+- **Codex:** the same server is added to the thread (`thread/start` and
+  `thread/resume`) as a config override for that thread only, never written to the
+  person's `config.toml`, limited to the two tools (`enabled_tools`) and set to run
+  without asking (`default_tools_approval_mode = "approve"`), so there is no card;
+  every other tool is asked about as before. Checked against a real Codex
+  app-server: the server starts from the override and a tool call reaches the
+  backend and answers.
+- **ACP agents:** the server is listed in `session/new` and `session/load`
+  (`mcpServers`, stdio). An ACP agent asks permission through its own request, which
+  names the tool in its own way, so a request is let through without a card only
+  when its title names one of the two tools and the `memory` server and its
+  arguments are only the ones those tools take (anything else, including a request
+  that names the tool but carries other arguments, is refused or asked about as
+  before, and an agent that sends none is simply never asked). An agent that does
+  not support or ignores MCP servers has no search and keeps the brief and recall.
+- **OpenAI-compatible endpoints and OpenRouter: not available.** That engine sends
+  one streamed `chat/completions` request per turn with no `tools`, reads only
+  `delta.content` from the answer, and has no loop that runs a tool and sends its
+  result back. Adding the search would mean adding that loop (tool definitions
+  sent to every endpoint, many local models do not support them, parsing streamed
+  tool calls, a bounded round trip, and its own disclosure and stop handling), which
+  is a different feature. Until then these agents have the recent-work brief and
+  automatic recall.
+
+## About me
+
+**About me** is one text about the person, shared by every agent (not one agent's
+notes, and read even by an agent whose notes are off). It is the first thing an
+agent is told after its instructions, as background that never grants permission,
+redacted when saved and again when loaded (the first 6,000 characters load).
+The person edits it (Memory panel, **About me**, or `PUT /api/v1/memory/about-me`
+with the hash they opened, so a concurrent change is a `409` and never lost).
+
+Agents add to it from the person's own words only. When a capture reads a
+conversation, the model marks a fact `aboutUser` only if it is a durable fact
+about the person themselves that any assistant should know (a diet, where they
+live, their company, how they like to be spoken to): never a fact about someone
+else, a decision about one project, anything only an agent said, or anything with
+an `until` day. It lists such a fact even when `MEMORY.md` already holds it
+(`noted`: kept only for About me, not filed twice). Each lands as a dated line
+naming the agent:
+
+    - 2026-10-23 · learned by Scout · The person is vegetarian
+
+and is also listed under **Added by your agents** with **Remove**. A removed
+fact is remembered by its text (spacing, a bullet and a final full stop ignored)
+and never added again; a fact already in About me, one that held something that
+looked like a secret, or one that would push it past 24,000 characters is not
+added. A batch that holds any line that is not the owner's own words (another
+person in a room) adds nothing to About me, whatever the model says. This is the
+only place a noticed fact leaves an agent's own folder, and what an agent learns
+here reaches every agent on the next turn.
+
+## Learning from group chats
+
+**Learn from group chats** (`learn_from_rooms` in the Memory settings, off by
+default, one switch for every agent; the switch under **Memory upkeep** in the
+agent's memory panel) lets a room feed a member agent's capture the same way a
+one-to-one chat does. When the agent finishes a room turn and its reply is in
+the room, what it read since it last spoke there (at most 12 lines) is read with
+its reply, batched per agent and room, under room rules:
+
+- the person's own lines count as theirs;
+- another person's lines (a room line whose author is marked as not the owner)
+  give only facts about the shared work, and never reach About me: a batch that
+  holds any of them adds nothing to About me, whatever the model says;
+- another agent's lines give only an outcome it verified or a decision the person
+  agreed to, never its suggestions, plans or claims, and nothing it says about the
+  person.
+
+A stretch with no person's words (only other agents) is skipped. Entries are
+sourced to the room: `- 2026-10-23 · from room "Launch" (noticed) · The launch
+moved to Friday`. The switch, the room and the agent's membership are checked
+again when the batch is captured, and the turns still waiting at a normal
+shutdown are kept as ids and rebuilt from the room at the next start. This app has
+one owner, so another person's lines appear only when a room message carries
+`owner: false` in its author; a room that fewer people can see than the agent
+cannot exist here, so that check has nothing to do. Never read: room hand-offs
+that carry no person's words, turns that did not succeed and agents whose notes
+or upkeep are off.
+
+## Organizing and the nightly tidy-up
+
+With upkeep on, two more model steps keep the files in shape (the same quick
+call as noticed facts, on the agent's own engine; where the engine has none,
+only the two steps that need no model run):
+
+- **Organizing.** One call looks at the dated lines of `MEMORY.md` it has not
+  judged before and moves the ones that are detail about a subject (another
+  person, a client, a trip, likes in one domain) into that subject's topic note,
+  unchanged, creating it with a header (`title`, `aliases`). Core facts stay: the
+  person's name, where they live, their work, how they like replies. A line about
+  diet, allergies or health is never even offered (a fixed rule, not the model's
+  choice), nor is a hand-written line, an expired or a struck one; a line judged
+  core is not asked about again. At most 20 move in a pass; an answer that names a
+  line that is not there is dropped whole, and so is one made stale by an edit
+  during the call. Each file's change is a journal row by **Memory upkeep**.
+- **Tidy-up.** Once a day after 3 am local time (`MEMORY_TIDY_HOUR`, 24 = never;
+  `tidy_hour` in the Memory settings overrides it),
+  at the next check if the computer was asleep, never while the agent is working,
+  and on **Tidy up now** (`POST /memory/tidy`): expired entries move to
+  `memory/archive.md` (marked `· expired <date>`; from `MEMORY.md` and topic
+  notes); of two entries with exactly the same fact the newer stays; and in
+  `MEMORY.md` and a few topic notes per pass a model call looks for pairs that
+  cannot both be true, striking the older through (`~~…~~ · superseded <date>`)
+  rather than deleting it. When that line also held something still true, that
+  part is kept as its own entry `from tidy-up`. At most a fifth of the live
+  entries are struck in one pass in `MEMORY.md` and none in a file of fewer than
+  five; a topic note may reconcile one pair even with two entries. Four files are
+  checked per pass, rotating through the topics. The archive is written before
+  the file it came from, and put back when that file then cannot be written (it
+  was edited meanwhile); when the archive is full, expired entries stay where
+  they are. A health or safety fact (diet, allergies, medication, disability) is
+  never archived, offered for moving or struck, whatever the model says; a
+  hand-written line is never touched. Prompts are redacted, and a moved or
+  struck entry keeps its continuation lines. "Exactly the same fact" is narrow on purpose: spacing, a
+  bullet and a final full stop are ignored, nothing else (`-10` and `10`, `C++`
+  and `C` are different facts).
+
+The model steps (noticing, organizing, tidy-up) run on the **quick-call model**
+chosen for the agent's engine in the Memory settings (`helper_models`, for
+example `{"claude": "haiku"}`; it overrides `MEMORY_HELPER_MODEL`, which
+overrides the built-in `haiku` on Claude). That is a model on the engine the agent
+already uses, never another provider; another provider is only ever the optional
+helper model below, and only for an engine that cannot write the job at all.
+
+The status route reports the last tidy-up. In the app, the **Memory upkeep** card
+under an agent's notes holds the per-agent switch (noticing and tidy-up together),
+**Tidy up now**, the tidy hour, the helper model for the agent's engine and the
+**Learn from group chats** switch; the **About me** tab beside Topic notes edits
+About me. Every upkeep change is undoable from the History tab, which names the
+step (noticing, organizing, tidy-up).
+
+## The helper model
+
+A **helper model** fills the gap an engine leaves. It is one connected engine, and
+optionally one of its models, that writes a small background text an agent's own
+engine cannot write here:
+
+- the memory upkeep steps (noticing facts, organizing, the tidy-up) for **Codex and
+  ACP agents**, which have no quick text call;
+- the model-written summary of a folded conversation for **ACP agents** (the only
+  engine besides an OpenAI-compatible endpoint that replays its conversation).
+
+An agent whose own engine can write a job (Claude, an OpenAI-compatible endpoint or
+OpenRouter) **always writes it itself**; the helper never takes its place, even when
+it is set.
+
+**Off unless you set it.** Choose the engine in the **Memory upkeep** card (**Helper
+on another provider**) or in the Memory settings:
+
+```
+PUT /api/v1/memory/settings   {"helper": {"engine": "claude", "model": "haiku"}}
+```
+
+`model` is optional (without it the engine's default for quick calls: `haiku` on
+Claude, the configured model on an endpoint). Only an engine with a quick text call
+can be chosen (`422 invalid_setting` otherwise; `GET /api/v1/engines` marks them
+`can_write_text`). `HELPER_ENGINE` and `HELPER_MODEL` in the server's environment win
+over the saved setting, and an empty `HELPER_ENGINE` switches a saved helper off
+(the card then says it is set by the environment). A model name that starts with a
+dash or has a space switches the helper off rather than write with a model nobody
+named.
+
+**What leaves the agent's provider.** With a helper set, the text those jobs read goes
+to the helper's engine, which may not be the one the agent runs on: the turns being
+noticed and the agent's notes (for upkeep), or the history being summarized (for a
+long conversation). It is redacted again just before it is sent. That is why it is
+opt-in. It applies to every agent whose engine cannot write the job, including one
+you run on a local model, unless you keep that agent off the helper (below).
+
+**Keeping one agent off the helper.** `use_helper: false` on the agent (`PATCH
+/api/v1/agents/{id}`; **Allow the helper model for this agent** in the card) stops
+the helper writing any of that agent's own jobs: no compaction summary, no upkeep.
+The agent then gets what it gets with no helper (excerpt summary, no noticing). The
+switch covers that agent's own jobs only: what it says in a room becomes part of
+the other agents' conversations, and their engines (and a helper, for theirs) read
+it. To keep an agent's text on the machine, run it on a local model, switch it off
+the helper, and keep it out of rooms with agents that are not set up the same way.
+A duplicate keeps the switch.
+
+**Visible and recorded.** The card says, for this agent, whether the helper is in
+use and where the text goes. A summary the helper wrote is marked in the transcript
+(*Written by the helper model ...*) and the stored event carries `written_by`; the
+last capture's status says `via: "helper"`. Every call is a row in a record beside
+the memory journal (agent, job, the helper's engine and model, whether it worked,
+and the tokens when the engine reported them; never the text) and shows in the
+**Usage** panel under **Helper model**, in `GET /api/v1/usage` as `helper`, and in
+the CSV as rows with status `helper` (or `helper_failed`).
+
+**Failure costs nothing.** A helper that is missing, not connected, failing or slow
+breaks nothing: the job falls back exactly as with no helper (an excerpt summary,
+no noticing), and the server log says once why the helper is not used. The one job
+a turn waits for is the compaction summary, held at most 20 seconds, and Stop ends
+the turn as with any summary.
+
+## The journal
+
+Every change made through the app to `MEMORY.md` or a topic note (an editor
+save, a topic deletion, an accepted proposal, an undo) is a row: which file,
+who (`person`, `proposal`, `upkeep`, `agent`, `import`, `undo`), created, edited or deleted, the before and
+after hashes, a short diff, and the earlier text, so **Undo** puts the file
+back without anything else. An undo is itself a row and can be undone. A row
+whose earlier text held something that looked like a secret keeps no earlier
+text and cannot be undone; neither can one whose earlier text was over 256 KB.
+The **History** tab shows the rows with their diffs.
+
+Changes an agent makes with its own file tools are caught at the turn
+boundary: when a turn starts the app notes what every memory file says, and when it
+ends whatever differs is a row by **Agent** (a file whose newest row already ends
+in its current text, because the app wrote and journaled it, is skipped). They can be
+undone like any row. A file edited between turns, outside the app, is not seen;
+two turns of one agent at once are both diffed, so a change may be recorded under
+whichever finished first. A journal failure never fails a turn.
+
+## API
+
+All under `/api/v1/agents/{id}`, admin scope only (not reachable by a
+chat-scope device), with sign-in like every route.
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| `GET` | `/memory/topics` | Topic notes (name, title, aliases, bytes, modified), the folder and the limits. |
+| `GET` | `/memory/topics/{name}` | One note: `text`, `hash`, `exists`. |
+| `PUT` | `/memory/topics/{name}` | `{text, expected_hash?}`; `409 memory_changed`, `413 memory_too_large`, `409 too_many_topics`, `422 invalid_topic_name`. |
+| `DELETE` | `/memory/topics/{name}` | Delete a note (`?expected_hash=` optional); 404 when there is none. |
+| `GET` | `/memory/journal?limit=` | Changes, newest first. |
+| `POST` | `/memory/journal/{entry}/undo` | Put the file back; `409 cannot_undo` with the reason. |
+| `GET` | `/memory/logs` | The days that have a daily log. |
+| `GET` | `/memory/logs/{day}` | One day's log (read-only, redacted); 404 when none. |
+| `DELETE` | `/memory/logs/{day}` | Delete one day's log. |
+| `POST` | `/memory/tidy` | Run the tidy-up now; `409 upkeep_off` / `409 agent_busy`. |
+| `GET` | `/memory/upkeep` | Whether quiet upkeep is on, whether the engine can make its call, the last capture. |
+| `GET` | `/memory/proposals` | Proposed notes (reads quiet conversations first). |
+| `POST` | `/memory/proposals/{id}/accept` | `{line?, target?}`: save it, or your edited line, into `MEMORY.md` or a topic. |
+| `POST` | `/memory/proposals/{id}/reject` | Drop it for good. |
+
+Installation-wide, under `/api/v1/memory` (admin scope):
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| `GET` / `PUT` | `/settings` | `tidy_hour` (0-23, 24 = never), `helper_models` (a model per engine), `learn_from_rooms` (bool, off by default) and `helper` (`{engine, model}` or `null`; `helper_active` shows what is in force, with its `source`). `422 invalid_setting`. |
+| `GET` | `/about-me` | `text`, `hash`, and the facts agents added (`learned`, newest first, each with `id`, `agent_name`, `at`). |
+| `PUT` | `/about-me` | `{text, expected_hash?}`; `409 memory_changed` (with `current`), `413 memory_too_large`. |
+| `DELETE` | `/about-me/learned/{id}` | Remove an agent-added fact for good; 404 when there is none. |
+
+`recall_enabled`, `memory_upkeep`, `compaction_summary` and `use_helper` are fields of the agent. Run
+`alembic upgrade head`: revision `e7a91c4d2b58` adds `agent.recall_enabled`, `c4d8f1a6e903`
+adds `agent.memory_upkeep`, `a5c3e8b1d7f2` adds `agent.compaction_summary` and
+`b6d1f4a9c3e7` adds `agent.use_helper` (all on for existing agents).
+
+## Not covered
+
+- The model-written compaction summary needs an engine with a quick call here (an OpenAI-compatible endpoint or OpenRouter), or, for an ACP agent, a helper model; without either the excerpt summary stands.
+- About me is one text for the whole installation; there is no per-person profile (the app has one owner).
+- Noticed facts need an engine with a quick call here (Claude, OpenAI-compatible, OpenRouter), or a helper model set for Codex and ACP agents; without either they are not read.
+- There is one helper for the installation, not one per agent or per engine; token counts of a helper call are recorded only when its engine reports them (an OpenAI-compatible endpoint does, the Claude CLI's text output does not).
+- Noticed facts come from one conversation at a time, one call each; several quiet conversations are not batched into one call.
+- Rooms are read for facts only with **Learn from group chats** on, and only a member agent's own turns.
+- Past-conversation search is a tool on Claude, Codex and ACP agents; an OpenAI-compatible endpoint has the brief and recall (it has no tool-call loop).
+- Recall ranks by shared words only (no stemming, no embeddings), so a
+  question worded differently from the note can miss it.
+- Proposals are found when the queue is looked at, not pushed.

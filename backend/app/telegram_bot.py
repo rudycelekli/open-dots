@@ -4,6 +4,7 @@ import re
 
 from fastapi.concurrency import run_in_threadpool
 from telegram import Update
+from telegram.constants import MessageLimit
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -16,6 +17,7 @@ from telegram.ext import (
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
+from app.db.transactions import release_snapshot
 from app.services import (
     auth_flow_service,
     link_service,
@@ -43,7 +45,8 @@ PROVIDER = "claude"
 DEFAULT_TTL_SECONDS = 1800
 
 POLL_INTERVAL_SECONDS = 3
-POLL_ATTEMPTS = 100
+# Give commands their full execution budget, plus a final status check.
+POLL_ATTEMPTS = task_execution_service.MAX_TASK_SECONDS // POLL_INTERVAL_SECONDS + 1
 
 # chat_id -> box_id, set while we're waiting for a pasted OAuth code.
 _awaiting_code: dict[int, str] = {}
@@ -64,21 +67,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _get_or_create_sandbox(user_id: str) -> str:
     async with AsyncSessionLocal() as db:
-        sandbox = await user_sandbox_service.get_active_by_user_id(db, user_id)
-        if sandbox is not None:
-            return sandbox.box_id
-
-        box = await run_in_threadpool(ascii_box_service.create_box, DEFAULT_TTL_SECONDS)
-        sandbox = await user_sandbox_service.create(
-            db,
-            user_id=user_id,
-            box_id=box.id,
-            state=box.state,
-            machine_type=box.type,
-            ttl_seconds=DEFAULT_TTL_SECONDS,
+        _, box = await user_sandbox_service.ensure(
+            db, user_id=user_id, ttl_seconds=DEFAULT_TTL_SECONDS
         )
-        return sandbox.box_id
-
+        return box.id
 
 async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
@@ -212,15 +204,25 @@ async def _poll_task(bot, chat_id: int, task_id: int) -> None:
         for _ in range(POLL_ATTEMPTS):
             if task is None or task.status not in task_execution_service.ACTIVE_STATUSES:
                 break
+            await release_snapshot(db)  # do not hold a snapshot while waiting
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
             task = await task_execution_service.sync_task_status(db, task)
 
     if task is None:
-        await bot.send_message(chat_id=chat_id, text="Task disappeared unexpectedly.")
+        message = "Task disappeared unexpectedly."
     elif task.status == "succeeded":
-        await bot.send_message(chat_id=chat_id, text=task.result or "Task completed.")
+        message = task.result or "Task completed."
+    elif task.status in task_execution_service.ACTIVE_STATUSES:
+        message = f"Task #{task.id} is still {task.status}. Check its status in the web UI."
     else:
-        await bot.send_message(chat_id=chat_id, text=f"Task failed: {task.error}")
+        message = f"Task failed: {task.error}"
+
+    # Reports and CLI errors can exceed Telegram's per-message text limit.
+    # Send every part in order rather than losing the entire completion.
+    for start in range(0, len(message), MessageLimit.MAX_TEXT_LENGTH):
+        await bot.send_message(
+            chat_id=chat_id, text=message[start:start + MessageLimit.MAX_TEXT_LENGTH]
+        )
 
 
 async def permission_ask_callback_handler(
@@ -357,7 +359,9 @@ async def schedules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             status = f"next run {s.next_run_at.strftime('%Y-%m-%d %H:%M UTC')}"
         lines.append(f"#{s.id} [{s.cron_expression}] {s.prompt_text[:60]} — {status}")
 
-    await update.message.reply_text("\n".join(lines))
+    message = "\n".join(lines)
+    for start in range(0, len(message), MessageLimit.MAX_TEXT_LENGTH):
+        await update.message.reply_text(message[start:start + MessageLimit.MAX_TEXT_LENGTH])
 
 
 async def _schedule_id_from_args(update: Update, usage: str) -> int | None:

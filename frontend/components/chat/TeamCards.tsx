@@ -1,0 +1,71 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { ApiError } from "@/lib/api";
+import { collaboration } from "@/lib/collaboration";
+import type { TeamJobItem, TranscriptItem } from "@/lib/transcript";
+import { JobCard } from "./TeamPanel";
+import { useSession } from "@/components/AuthGate";
+
+export function DelegationCard({ item }: { item: TeamJobItem }) {
+  return <JobCard compact job={{ id: item.jobId, root_id: null, parent_id: null, depth: 0, requester_agent_id: 0, assignee_agent_id: item.agentId, assignee_thread_id: item.threadId, mode: item.mode, brief: item.brief, status: item.status, result: item.result, outcome: item.outcome }} />;
+}
+export function AgentCreatedCard({ item }: { item: Extract<TranscriptItem, { kind: "agent_created" }> }) {
+  const [state, setState] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [available, setAvailable] = useState(false);
+  const { session } = useSession();
+  useEffect(() => {
+    let live = true;
+    collaboration.undoState(item.agentId).then(r => { if (live) setAvailable(r.available); }, () => { if (live) setAvailable(false); });
+    return () => { live = false; };
+  }, [item.agentId]);
+  const undo = async () => {
+    setState("busy"); setError(null);
+    try { const result = await collaboration.undoCreate(item.agentId); setState(result.removed); }
+    catch (err) { setState(""); setError(err instanceof ApiError ? err.message : "Could not undo this specialist."); }
+  };
+  return <article className="space-y-2 rounded-field border border-line p-3 text-sm"><p><strong>Specialist created: {item.name || `Agent ${item.agentId}`}</strong>{item.title ? ` · ${item.title}` : ""}</p><p className="text-xs text-muted">Instructions were written by the lead. Review them in Agents.</p>{session?.scopes.includes("admin") && available && !state && <button type="button" className="text-xs underline" onClick={() => void undo()}>Undo creation</button>}{state && <p role="status" className="text-xs text-muted">{state === "busy" ? "Undoing…" : `Specialist ${state}.`}</p>}{error && <p role="alert" className="text-xs text-danger">{error}</p>}</article>;
+}
+
+const STALE: Record<string, string> = {
+  changed_since: "Something changed since this was applied, so it was left alone.",
+  agent_used: "A specialist this added has already been used, so it was kept.",
+  agent_busy: "A teammate is working right now. Try again when it is idle.",
+};
+const VERB: Record<string, string> = { created: "Added", updated: "Updated", deleted: "Deleted" };
+
+export function TeamSetupCard({ item }: { item: Extract<TranscriptItem, { kind: "team_setup" }> }) {
+  const [state, setState] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const { session } = useSession();
+  const undo = async () => {
+    setState("busy"); setError(null);
+    try { await collaboration.undoSetup(item.requestId); setState("undone"); }
+    catch (err) { setState(""); setError(err instanceof ApiError ? STALE[err.code ?? ""] ?? err.message : "Could not undo this change."); }
+  };
+  const canUndo = item.undoAvailable && !state && session?.scopes.includes("admin");
+  return (
+    <article className="space-y-2 rounded-field border border-line p-3 text-sm">
+      <p><strong>Team updated by the lead</strong></p>
+      <ul className="text-xs text-muted">{item.rows.map((row) => <li key={`${row.action}-${row.agentId}`}>{VERB[row.action] ?? row.action}: {row.name || `Agent ${row.agentId}`}</li>)}</ul>
+      {canUndo && <button type="button" className="text-xs underline" onClick={() => void undo()}>Undo</button>}
+      {state && <p role="status" className="text-xs text-muted">{state === "busy" ? "Undoing…" : "Undone."}</p>}
+      {error && <p role="alert" className="text-xs text-danger">{error}</p>}
+    </article>
+  );
+}
+
+const NOTICE_LABEL = { incident: "Incident", escalation: "Escalation", refused: "Report not delivered", retried: "Retry" } as const;
+
+// What the lead was told about a teammate (or what it retried). The text is
+// quoted data from other agents; it is only ever shown, never acted on here.
+export function TeamNoticeCard({ item }: { item: Extract<TranscriptItem, { kind: "team_notice" }> }) {
+  return (
+    <article className="flex items-start justify-between gap-3 rounded-field border border-line p-3 text-sm">
+      <p className="min-w-0 break-words"><strong>{NOTICE_LABEL[item.tone]}</strong>{" · "}{item.text.replace(/^(Incident|Escalation): /, "")}</p>
+      {item.threadId !== null && <Link href={`/chat?thread=${item.threadId}`} className="shrink-0 text-xs underline">Open</Link>}
+    </article>
+  );
+}
